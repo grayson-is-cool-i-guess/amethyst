@@ -9,3 +9,5 @@ no source code will be posted for now (because its so skidded) and because you d
 
 # please, PLEASE, never expect this to be used commonly.
 amethyst is in very early beta. its performance will not be great. i've already heavily optimized it to run at how it is. this is literally running with a node server and a prayer.
+
+most of the frontend is chatgpt, i was too lazy to write it myself

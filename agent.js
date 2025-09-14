@@ -1,16 +1,12 @@
-// host-agent.js
-// Run this on the machine that should receive mouse/keyboard events.
-// Example usage (Linux/macOS):
-//   ROOM_CODE=ABC SERVER_URL="http://your-server:3000" node host-agent.js
-// Example usage (Windows cmd):
-//   set ROOM_CODE=ABC&& set SERVER_URL=http://your-server:3000&& node host-agent.js
+// agent.js for amethyst
 //
-// Optional env:
-//   AGENT_SECRET - if your server requires a secret to register an agent.
+// this was written by chatgpt
+// clown me on it, i dont care
 
-const SERVER = process.env.SERVER_URL || 'http://localhost:3000';
+
+const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
-const AGENT_SECRET = process.env.AGENT_SECRET || null; // optional auth secret
+const AGENT_SECRET = process.env.AGENT_SECRET || null;
 
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
@@ -39,7 +35,6 @@ try {
   process.exit(2);
 }
 
-// Build a key map (letters, digits, common keys)
 const NUT_KEY_MAP = {};
 if (nutKey) {
   const letters = 'abcdefghijklmnopqrstuvwxyz';
@@ -78,6 +73,15 @@ async function moveMouseForPayload(xNorm, yNorm) {
       await nutMouse.setPosition({ x, y });
     } else if (typeof nutMouse.move === 'function') {
       await nutMouse.move({ x, y });
+    }
+
+    // Immediately inform server/viewers of the new cursor position so viewers can render it locally
+    try {
+      if (socket && socket.connected) {
+        socket.emit('agent-mouse', { code: ROOM, xNorm: Number(xNorm) || 0, yNorm: Number(yNorm) || 0 });
+      }
+    } catch (e) {
+      console.error('[agent] emit agent-mouse failed', e);
     }
   } catch (e) {
     console.error('[agent] moveMouseForPayload failed', e);
@@ -132,7 +136,6 @@ socket.on('connect', () => {
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   try {
     if (!payload) return;
-    // Mouse actions
     if (payload.type === 'mouse') {
       if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
         moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>console.error('[agent] move error', e));
@@ -153,14 +156,21 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
       return;
     }
 
-    // Key actions
     if (payload.type === 'key') {
       const rawKey = (payload && payload.rawKey) ? String(payload.rawKey) : String(payload && payload.key || '');
       const lowKey = String((payload && payload.key) || rawKey || '').toLowerCase();
-      const mapped = lowKey;
+      // make mapped mutable so we can normalize simple arrow names
+      let mapped = lowKey;
       const MODIFIERS = new Set(['shift','control','ctrl','alt','meta','command','capslock']);
 
-      // modifiers
+      // Defensive: accept browser-style simple names ('left','right','up','down') as well
+      // as 'arrowleft' etc. Normalize to 'arrow*' because NUT_KEY_MAP uses 'arrowleft'.
+      try {
+        if (['left','right','up','down'].includes(mapped)) {
+          mapped = 'arrow' + mapped;
+        }
+      } catch(e){}
+
       if (MODIFIERS.has(mapped)) {
         const mappedKeyEnum = NUT_KEY_MAP[mapped];
         if (payload.action === 'down') {
@@ -175,7 +185,6 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
         return;
       }
 
-      // normal keys
       const mappedKeyEnum = NUT_KEY_MAP[mapped];
       if (payload.action === 'down') {
         if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {

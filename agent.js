@@ -1,7 +1,6 @@
-// agent.js for amethyst
-//
-// this was written by chatgpt
-// clown me on it, i dont care
+// agent.js
+// mostly made by gpt
+// clown on me idc
 
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
@@ -138,6 +137,7 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
     if (!payload) return;
     if (payload.type === 'mouse') {
       if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
+        // move OS mouse, then emit agent-mouse in moveMouseForPayload -> viewers get near-instant cursor
         moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>console.error('[agent] move error', e));
       } else if (payload.action === 'click') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';

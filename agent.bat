@@ -6,7 +6,7 @@ if "%PROCESSOR_ARCHITECTURE%"=="x86" set "INSTALL_DIR=%ProgramFiles(x86)%\Amethy
 if not exist "%ProgramFiles%" set "INSTALL_DIR=%TEMP%\AmethystAgent"
 
 set "AGENT_URL=https://github.com/grayson-is-cool-i-guess/amethyst/raw/refs/heads/main/agent.js"
-set "AGENT_NPM_PACKAGES=@nut-tree-fork/nut-js socket.io-client"
+set "AGENT_NPM_PACKAGES=@nut-tree-fork/nut-js socket.io-client socket.io"
 
 >nul 2>&1 net session
 if %errorlevel% neq 0 (
@@ -29,6 +29,7 @@ powershell -Command "Invoke-WebRequest -Uri '%AGENT_URL%' -OutFile '%INSTALL_DIR
 cd /d "%INSTALL_DIR%"
 if not exist package.json npm init -y >nul 2>&1
 
+:: Install all required npm packages
 start cmd /k "cd /d %INSTALL_DIR% && npm install %AGENT_NPM_PACKAGES%"
 
 pause

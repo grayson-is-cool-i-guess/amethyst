@@ -3,6 +3,9 @@
 // small performance & noise improvements (caching, emit-throttle, debug flag)
 // + pointer-lock / relative mouse support
 // + automatic "DVD" screensaver on local idle
+//
+// Requires: npm i socket.io-client @nut-tree-fork/nut-js
+// Set ROOM_CODE env var to the 3-character room code you want the agent to register for.
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
@@ -230,7 +233,7 @@ async function mouseScrollPayload(dx, dy) {
    - Screensaver moves cursor in bouncing pattern until user physically moves mouse.
    - We avoid treating our own programmatic moves as "physical" by tracking lastProgrammaticMove.
 */
-const INACTIVITY_MS = Number(process.env.AGENT_SCREENSAVER_INACTIVITY_MS || 18000); // 3 minutes default
+const INACTIVITY_MS = Number(process.env.AGENT_SCREENSAVER_INACTIVITY_MS || 180000); // 3 minutes default
 const SS_TICK_MS = Number(process.env.AGENT_SCREENSAVER_TICK_MS || 50); // movement tick
 let lastPhysicalMoveAt = Date.now();
 let lastProgrammaticMove = 0;
@@ -373,7 +376,10 @@ socket.on('connect', () => {
 // Receive control forwarded from server (viewer actions)
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   try {
-    lastViewerControlAt = Date.now(); // note: viewer is controlling, avoid screensaver
+    // Immediately note viewer control and stop any screensaver so control can take effect
+    lastViewerControlAt = Date.now();
+    if (screensaverActive) stopScreensaver('viewer control');
+
     if (!payload) return;
 
     if (payload.type === 'mouse') {

@@ -1,11 +1,16 @@
 // agent.js
 // mostly made by gpt
 // small performance & noise improvements (caching, emit-throttle, debug flag)
+// + pointer-lock / relative mouse support
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
 const AGENT_DEBUG = process.env.AGENT_DEBUG === '1' || false;
+// sensitivity multiplier applied to pointer-lock deltas (client can also scale)
+const AGENT_SENSITIVITY = Number(process.env.AGENT_SENSITIVITY || 1.0);
+// min ms between agent->server cursor broadcasts (throttle)
+const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16); // ~60Hz default
 
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
@@ -74,10 +79,37 @@ async function refreshScreenSizeOnce() {
   } catch (e) { if (AGENT_DEBUG) console.warn('[agent] refreshScreenSize failed', e); }
 }
 
+// periodically refresh screen size in case resolution/monitor changes
+setInterval(()=>{ refreshScreenSizeOnce().catch(()=>{}); }, 15_000);
+
 // agent-mouse emit throttle (ms) to reduce network pressure while keeping local movement immediate
-const AGENT_MOUSE_EMIT_MIN_MS = 16; // ~60 updates/sec max
 let _lastAgentEmitAt = 0;
 
+/**
+ * Emit normalized cursor to server (throttled).
+ * code is ROOM.
+ */
+function emitAgentMouseNormalized(x, y) {
+  try {
+    const now = Date.now();
+    if (socket && socket.connected && (now - _lastAgentEmitAt) >= AGENT_MOUSE_EMIT_MIN_MS) {
+      // clamp to [0,1] and send
+      const nx = Math.max(0, Math.min(1, x));
+      const ny = Math.max(0, Math.min(1, y));
+      socket.emit('agent-mouse', { code: ROOM, xNorm: Number(nx) || 0, yNorm: Number(ny) || 0 });
+      _lastAgentEmitAt = now;
+      if (AGENT_DEBUG) dlog('[agent] emit agent-mouse', nx, ny);
+    }
+  } catch (e) {
+    if (AGENT_DEBUG) console.error('[agent] emit agent-mouse failed', e);
+  }
+}
+
+function dlog(...a){ if(AGENT_DEBUG) console.debug('[agent dbg]', ...a); }
+
+/**
+ * Move OS cursor to absolute normalized position (existing behavior).
+ */
 async function moveMouseForPayload(xNorm, yNorm) {
   try {
     if (!nutMouse) return;
@@ -93,17 +125,60 @@ async function moveMouseForPayload(xNorm, yNorm) {
     }
 
     // Throttle emits: move local cursor immediately, but only broadcast position at limited rate
-    try {
-      const now = Date.now();
-      if (socket && socket.connected && (now - _lastAgentEmitAt) >= AGENT_MOUSE_EMIT_MIN_MS) {
-        socket.emit('agent-mouse', { code: ROOM, xNorm: Number(xNorm) || 0, yNorm: Number(yNorm) || 0 });
-        _lastAgentEmitAt = now;
-      }
-    } catch (e) {
-      if (AGENT_DEBUG) console.error('[agent] emit agent-mouse failed', e);
-    }
+    emitAgentMouseNormalized(x / Math.max(1, w - 1), y / Math.max(1, h - 1));
   } catch (e) {
     if (AGENT_DEBUG) console.error('[agent] moveMouseForPayload failed', e);
+  }
+}
+
+/**
+ * Move OS cursor by relative delta (pointer-lock / game mode).
+ * dx/dy are device deltas (integers). We apply sensitivity and clamp to screen edges.
+ */
+async function moveMouseRelative(dx, dy) {
+  try {
+    if (!nutMouse) return;
+    // ensure cached screen size reasonably fresh
+    await refreshScreenSizeOnce().catch(()=>{});
+
+    const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
+    const h = (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768;
+
+    // get current OS cursor position; fallback to center
+    let pos = { x: Math.floor(w / 2), y: Math.floor(h / 2) };
+    try {
+      if (typeof nutMouse.getPosition === 'function') {
+        const p = await nutMouse.getPosition();
+        // nut.js historically returns {x,y} — handle arrays/other shapes defensively
+        if (p && typeof p === 'object' && typeof p.x === 'number' && typeof p.y === 'number') {
+          pos = { x: Math.round(p.x), y: Math.round(p.y) };
+        } else if (Array.isArray(p) && p.length >= 2) {
+          pos = { x: Math.round(p[0]), y: Math.round(p[1]) };
+        }
+      }
+    } catch (e) {
+      if (AGENT_DEBUG) dlog('[agent] getPosition fallback', e && e.message ? e.message : e);
+    }
+
+    // apply sensitivity and integer rounding
+    const sx = Math.trunc(Math.round(Number(dx || 0) * AGENT_SENSITIVITY));
+    const sy = Math.trunc(Math.round(Number(dy || 0) * AGENT_SENSITIVITY));
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v|0));
+    const newX = clamp(pos.x + sx, 0, w - 1);
+    const newY = clamp(pos.y + sy, 0, h - 1);
+
+    if (typeof nutMouse.setPosition === 'function') {
+      await nutMouse.setPosition({ x: newX, y: newY });
+    } else if (typeof nutMouse.move === 'function') {
+      await nutMouse.move({ x: newX, y: newY });
+    }
+
+    // broadcast normalized cursor (throttled) so viewers receive instant cursor feedback
+    emitAgentMouseNormalized(newX / Math.max(1, w - 1), newY / Math.max(1, h - 1));
+    if (AGENT_DEBUG) dlog('[agent] moved relative', dx, dy, '->', newX, newY);
+  } catch (e) {
+    if (AGENT_DEBUG) console.error('[agent] moveMouseRelative failed', e);
   }
 }
 
@@ -157,7 +232,19 @@ socket.on('connect', () => {
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   try {
     if (!payload) return;
+
     if (payload.type === 'mouse') {
+      // RELATIVE (pointer-lock / game-mode): dx / dy integer deltas
+      if (payload.action === 'relative') {
+        // accept either payload.dx/payload.dy or payload.deltaX/payload.deltaY
+        const dx = Number(typeof payload.dx !== 'undefined' ? payload.dx : payload.deltaX || 0) || 0;
+        const dy = Number(typeof payload.dy !== 'undefined' ? payload.dy : payload.deltaY || 0) || 0;
+        // apply relative move
+        moveMouseRelative(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] rel move error', e); });
+        return;
+      }
+
+      // ABSOLUTE normalized mapping (existing behavior)
       if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
         // move OS mouse quickly, then emit agent-mouse (throttled) from moveMouseForPayload
         moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move error', e); });

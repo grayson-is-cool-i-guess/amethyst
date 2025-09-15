@@ -1,11 +1,9 @@
 // agent.js
-// mostly made by gpt
-// small performance & noise improvements (caching, emit-throttle, debug flag)
+// improved: cache screen size, throttle mouse updates, use setPosition if available, minimal hot-path logging
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
-const AGENT_DEBUG = process.env.AGENT_DEBUG === '1' || false;
 
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
@@ -27,7 +25,7 @@ try {
   nutScreen = nut.screen;
   try { if (nutKeyboard && nutKeyboard.config) nutKeyboard.config.autoDelayMs = 0; } catch(e){}
   try { if (nutMouse && nutMouse.config) nutMouse.config.mouseSpeed = 100; } catch(e){}
-  if (AGENT_DEBUG) console.log('[agent] nut.js loaded — agent will perform input locally');
+  console.log('[agent] nut.js loaded — agent will perform input locally');
 } catch (e) {
   console.error('[agent] failed to load @nut-tree-fork/nut-js. Install it: npm i @nut-tree-fork/nut-js');
   console.error('[agent] full error:', e && e.message ? e.message : e);
@@ -61,51 +59,52 @@ function mapButton(b) {
   return nutButton.LEFT;
 }
 
-// cache screen size to avoid repeated OS calls
-let _cachedScreen = { w: 1024, h: 768 };
-async function refreshScreenSizeOnce() {
+// Cached host screen values to avoid repeated system calls
+let cachedScreen = { w: 1024, h: 768, lastAt: 0 };
+async function refreshScreenCache() {
   try {
-    if (nutScreen && typeof nutScreen.width === 'function' && typeof nutScreen.height === 'function') {
-      const w = await nutScreen.width();
-      const h = await nutScreen.height();
-      if (w && h) _cachedScreen = { w, h };
-      if (AGENT_DEBUG) console.info('[agent] cached screen size', _cachedScreen);
-    }
-  } catch (e) { if (AGENT_DEBUG) console.warn('[agent] refreshScreenSize failed', e); }
+    if (!nutScreen) return;
+    const now = Date.now();
+    if (now - cachedScreen.lastAt < 2000) return;
+    let w = 1024, h = 768;
+    try { w = await nutScreen.width(); h = await nutScreen.height(); } catch(e){}
+    cachedScreen.w = w || cachedScreen.w;
+    cachedScreen.h = h || cachedScreen.h;
+    cachedScreen.lastAt = now;
+  } catch(e){}
 }
-
-// agent-mouse emit throttle (ms) to reduce network pressure while keeping local movement immediate
-const AGENT_MOUSE_EMIT_MIN_MS = 16; // ~60 updates/sec max
-let _lastAgentEmitAt = 0;
 
 async function moveMouseForPayload(xNorm, yNorm) {
   try {
     if (!nutMouse) return;
-    // use cached screen size (cheaper)
-    const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
-    const h = (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768;
+    await refreshScreenCache();
+    const w = cachedScreen.w || 1024;
+    const h = cachedScreen.h || 768;
     const x = Math.round(Math.max(0, Math.min(1, xNorm)) * (w - 1));
     const y = Math.round(Math.max(0, Math.min(1, yNorm)) * (h - 1));
+
+    // Use setPosition if available (generally faster than move)
     if (typeof nutMouse.setPosition === 'function') {
       await nutMouse.setPosition({ x, y });
     } else if (typeof nutMouse.move === 'function') {
       await nutMouse.move({ x, y });
     }
 
-    // Throttle emits: move local cursor immediately, but only broadcast position at limited rate
+    // Immediately inform server/viewers of the new cursor position so viewers can render it locally
     try {
-      const now = Date.now();
-      if (socket && socket.connected && (now - _lastAgentEmitAt) >= AGENT_MOUSE_EMIT_MIN_MS) {
+      if (socket && socket.connected) {
         socket.emit('agent-mouse', { code: ROOM, xNorm: Number(xNorm) || 0, yNorm: Number(yNorm) || 0 });
-        _lastAgentEmitAt = now;
       }
     } catch (e) {
-      if (AGENT_DEBUG) console.error('[agent] emit agent-mouse failed', e);
+      // silent
     }
   } catch (e) {
-    if (AGENT_DEBUG) console.error('[agent] moveMouseForPayload failed', e);
+    // reduce noisy logging on hot path
   }
 }
+
+let lastMouseEmitAt = 0;
+const AGENT_MOUSE_MIN_MS = Number(process.env.AGENT_MOUSE_MIN_MS) || 6;
 
 async function mouseClickPayload(buttonName) {
   try {
@@ -118,19 +117,21 @@ async function mouseClickPayload(buttonName) {
       await nutMouse.pressButton(b);
       await nutMouse.releaseButton(b);
     }
-  } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseClick failed', e); }
+  } catch (e) { /* quiet */ }
 }
 async function mouseDownPayload(buttonName) {
-  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.pressButton === 'function') await nutMouse.pressButton(b); } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseDown failed', e); }
+  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.pressButton === 'function') await nutMouse.pressButton(b); } catch (e) { /* quiet */ }
 }
 async function mouseUpPayload(buttonName) {
-  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.releaseButton === 'function') await nutMouse.releaseButton(b); } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseUp failed', e); }
+  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.releaseButton === 'function') await nutMouse.releaseButton(b); } catch (e) { /* quiet */ }
 }
 async function mouseScrollPayload(dx, dy) {
   try {
     if (!nutMouse) return;
     dx = Math.trunc(dx || 0);
     dy = Math.trunc(dy || 0);
+
+    // Prefer wheel APIs if available
     if (Math.abs(dy) >= Math.abs(dx)) {
       if (dy > 0 && typeof nutMouse.scrollDown === 'function') return nutMouse.scrollDown(Math.abs(dy));
       if (dy < 0 && typeof nutMouse.scrollUp === 'function') return nutMouse.scrollUp(Math.abs(dy));
@@ -138,42 +139,51 @@ async function mouseScrollPayload(dx, dy) {
       if (dx > 0 && typeof nutMouse.scrollRight === 'function') return nutMouse.scrollRight(Math.abs(dx));
       if (dx < 0 && typeof nutMouse.scrollLeft === 'function') return nutMouse.scrollLeft(Math.abs(dx));
     }
-  } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseScroll failed', e); }
+  } catch (e) { /* quiet */ }
 }
 
 socket.on('connect', () => {
-  if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
-  // refresh screen size once on connect
-  refreshScreenSizeOnce().catch(()=>{});
+  console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   socket.emit('agent-register', { code: ROOM, secret: AGENT_SECRET }, (res) => {
     if (!res || !res.success) {
       console.error('[agent] agent-register failed', res);
       return;
     }
-    if (AGENT_DEBUG) console.log('[agent] agent registered for room', ROOM);
+    console.log('[agent] agent registered for room', ROOM);
+    // refresh screen cache on (re)connect
+    refreshScreenCache().catch(()=>{});
   });
 });
 
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   try {
     if (!payload) return;
+
+    // throttle high-frequency mouse moves from viewers: ensure at least AGENT_MOUSE_MIN_MS between move applies
     if (payload.type === 'mouse') {
       if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
-        // move OS mouse quickly, then emit agent-mouse (throttled) from moveMouseForPayload
-        moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move error', e); });
+        const now = Date.now();
+        if (now - lastMouseEmitAt < AGENT_MOUSE_MIN_MS) {
+          // but still emit latest cursor to viewers immediately (server-side) — we still move less often
+          try { socket.emit('agent-mouse', { code: ROOM, xNorm: Number(payload.xNorm) || 0, yNorm: Number(payload.yNorm) || 0 }); } catch(e){}
+          return;
+        }
+        lastMouseEmitAt = now;
+        // move OS mouse, then emit agent-mouse in moveMouseForPayload -> viewers get near-instant cursor
+        moveMouseForPayload(payload.xNorm, payload.yNorm).catch(()=>{});
       } else if (payload.action === 'click') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseClickPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] click error', e); });
+        mouseClickPayload(btn).catch(()=>{});
       } else if (payload.action === 'down') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseDownPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mdown error', e); });
+        mouseDownPayload(btn).catch(()=>{});
       } else if (payload.action === 'up') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseUpPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mup error', e); });
+        mouseUpPayload(btn).catch(()=>{});
       } else if (payload.action === 'scroll') {
         const dx = Math.trunc(payload.deltaX || 0);
         const dy = Math.trunc(payload.deltaY || 0);
-        mouseScrollPayload(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] scroll error', e); });
+        mouseScrollPayload(dx, dy).catch(()=>{});
       }
       return;
     }
@@ -186,7 +196,6 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
       const MODIFIERS = new Set(['shift','control','ctrl','alt','meta','command','capslock']);
 
       // Defensive: accept browser-style simple names ('left','right','up','down') as well
-      // as 'arrowleft' etc. Normalize to 'arrow*' because NUT_KEY_MAP uses 'arrowleft'.
       try {
         if (['left','right','up','down'].includes(mapped)) {
           mapped = 'arrow' + mapped;
@@ -197,11 +206,11 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
         const mappedKeyEnum = NUT_KEY_MAP[mapped];
         if (payload.action === 'down') {
           if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-            nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
+            nutKeyboard.pressKey(mappedKeyEnum).catch(()=>{});
           }
         } else if (payload.action === 'up') {
           if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-            nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] releaseKey failed', e); });
+            nutKeyboard.releaseKey(mappedKeyEnum).catch(()=>{});
           }
         }
         return;
@@ -210,26 +219,26 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
       const mappedKeyEnum = NUT_KEY_MAP[mapped];
       if (payload.action === 'down') {
         if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-          nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
+          nutKeyboard.pressKey(mappedKeyEnum).catch(()=>{});
         } else {
           const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
           if (toType && nutKeyboard && nutKeyboard.type) {
-            nutKeyboard.type(toType).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] type failed', e); });
+            nutKeyboard.type(toType).catch(()=>{});
           }
         }
         return;
       } else if (payload.action === 'up') {
         if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-          nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] release failed', e); });
+          nutKeyboard.releaseKey(mappedKeyEnum).catch(()=>{});
         }
         return;
       }
     }
   } catch (err) {
-    if (AGENT_DEBUG) console.error('[agent] control-from-viewer handler error', err);
+    // quiet
   }
 });
 
 socket.on('disconnect', () => {
-  if (AGENT_DEBUG) console.log('[agent] disconnected from server');
+  // minimal logging on disconnect
 });

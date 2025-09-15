@@ -1,11 +1,5 @@
 // agent.js
-// mostly made by gpt
-// small performance & noise improvements (caching, emit-throttle, debug flag)
-// + pointer-lock / relative mouse support
-// + automatic "DVD" screensaver on local idle
-//
-// Requires: npm i socket.io-client @nut-tree-fork/nut-js
-// Set ROOM_CODE env var to the 3-character room code you want the agent to register for.
+// made by gpt
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
@@ -469,4 +463,5 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
 socket.on('disconnect', () => {
   if (AGENT_DEBUG) console.log('[agent] disconnected from server');
 });
+
 

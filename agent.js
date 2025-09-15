@@ -239,7 +239,7 @@ const AGENT_SCREENSAVER_DISABLE = process.env.AGENT_SCREENSAVER_DISABLE === '1';
 
 
 
-const TIMETHINGY = 180;
+const TIMETHINGY = 5;
 
 
 
@@ -575,3 +575,4 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
 socket.on('disconnect', () => {
   if (AGENT_DEBUG) console.log('[agent] disconnected from server');
 });
+

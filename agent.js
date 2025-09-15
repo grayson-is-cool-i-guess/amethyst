@@ -188,7 +188,7 @@ async function mouseScrollPayload(dx, dy) {
 }
 
 const AGENT_SCREENSAVER_DISABLE = process.env.AGENT_SCREENSAVER_DISABLE === '1';
-const INACTIVITY_MS = AGENT_SCREENSAVER_DISABLE ? Number.MAX_SAFE_INTEGER : Number(5800); // this is where it takes the time to do whatever
+const INACTIVITY_MS = AGENT_SCREENSAVER_DISABLE ? Number.MAX_SAFE_INTEGER : Number(120000); // this is where it takes the time to do whatever
 const SS_TICK_MS = Number(process.env.AGENT_SCREENSAVER_TICK_MS || 50);
 const AGENT_SCREENSAVER_EXIT_DELTA = Number(process.env.AGENT_SCREENSAVER_EXIT_DELTA || 18);
 
@@ -398,4 +398,5 @@ try {
 } catch (e) {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
+
 

@@ -1,5 +1,7 @@
 // agent.js
-// made by gpt
+// modified to improve screensaver exit heuristics (opposite direction, speed, jump)
+// hotkey to stop screensaver: Ctrl + Alt + 1
+// timings configured in seconds via env vars for convenience
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
@@ -8,7 +10,7 @@ const AGENT_DEBUG = process.env.AGENT_DEBUG === '1' || false;
 // sensitivity multiplier applied to pointer-lock deltas (client can also scale)
 const AGENT_SENSITIVITY = Number(process.env.AGENT_SENSITIVITY || 1.0);
 // min ms between agent->server cursor broadcasts (throttle)
-const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16); // ~60Hz default
+const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16); // ~60Hz default (ms)
 
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
@@ -223,18 +225,43 @@ async function mouseScrollPayload(dx, dy) {
 /* -----------------------------
    Screensaver / idle detection
    -----------------------------
-   - If no *physical* mouse movement for INACTIVITY_MS, start screensaver.
-   - Screensaver moves cursor in bouncing pattern until user physically moves mouse.
-   - We avoid treating our own programmatic moves as "physical" by tracking lastProgrammaticMove.
+   - Improved heuristics:
+     * If user moves mouse opposite to screensaver velocity with a large jump -> treat as human
+     * If user moves mouse very fast (speed threshold) -> treat as human
+     * If user jumps the cursor (large distance in one sample) -> treat as human
+   - Timings are provided in seconds via env vars for convenience.
 */
-const INACTIVITY_MS = Number(process.env.AGENT_SCREENSAVER_INACTIVITY_MS || 5800); // 3 minutes default
-const SS_TICK_MS = Number(process.env.AGENT_SCREENSAVER_TICK_MS || 50); // movement tick
+
+const AGENT_SCREENSAVER_DISABLE = process.env.AGENT_SCREENSAVER_DISABLE === '1'; // set to '1' to disable screensaver
+// inactivity time (seconds). Default: 180s (3 minutes). Set AGENT_SCREENSAVER_INACTIVITY_S
+
+
+
+
+
+const TIMETHINGY = 180;
+
+
+
+
+
+const INACTIVITY_S = AGENT_SCREENSAVER_DISABLE ? Number.POSITIVE_INFINITY : TIMETHINGY;
+// tick period for screensaver movement (seconds). Default 0.05 (50ms). Set AGENT_SCREENSAVER_TICK_S
+const SS_TICK_S = Number(process.env.AGENT_SCREENSAVER_TICK_S || 0.05);
+// exit delta (pixels) — single-sample jump over this many pixels triggers exit. Set AGENT_SCREENSAVER_EXIT_DELTA
+const AGENT_SCREENSAVER_EXIT_DELTA = Number(process.env.AGENT_SCREENSAVER_EXIT_DELTA || 18);
+// exit speed (pixels/second) — if movement speed exceeds this, treat as human. Set AGENT_SCREENSAVER_EXIT_SPEED
+const AGENT_SCREENSAVER_EXIT_SPEED = Number(process.env.AGENT_SCREENSAVER_EXIT_SPEED || 800);
+// used for opposite-direction detection: normalized dot threshold (negative -> opposite). Set AGENT_SCREENSAVER_OPPOSITE_DOT
+const AGENT_SCREENSAVER_OPPOSITE_DOT = Number(process.env.AGENT_SCREENSAVER_OPPOSITE_DOT || -0.3);
+
 let lastPhysicalMoveAt = Date.now();
 let lastProgrammaticMove = 0;
 let lastObservedPos = null;
+let lastObservedAt = null;
 let screensaverActive = false;
 let ssTimer = null;
-let ssState = { x: 0, y: 0, vx: 3, vy: 2 };
+let ssState = { x: 0, y: 0, vx: 3, vy: 2 }; // vx/vy are pixels per tick initially (we don't depend on absolute)
 let lastViewerControlAt = 0; // don't screensaver while viewers actively control
 
 // read current OS cursor position (defensive)
@@ -254,21 +281,65 @@ async function getCurrentPosFallback() {
   return { x: Math.floor(w/2), y: Math.floor(h/2) };
 }
 
-// sample physical mouse movement periodically
+/**
+ * Heuristics:
+ * - if changed and programmaticGap > 700ms -> treat as physical (original behavior)
+ * - OR if dist >= EXIT_DELTA_PIX -> treat as physical (jump)
+ * - OR if speed >= EXIT_SPEED_PIX_PER_S -> treat as physical (fast)
+ * - OR if movement direction is substantially opposite screensaver velocity and dist >= EXIT_DELTA_PIX -> treat as physical
+ */
 async function sampleMouseMovement() {
   try {
     const pos = await getCurrentPosFallback();
-    if (!lastObservedPos) { lastObservedPos = pos; return; }
-    // if position changed and it was not caused by our programmatic move, consider physical
-    const changed = (pos.x !== lastObservedPos.x) || (pos.y !== lastObservedPos.y);
     const now = Date.now();
-    // if moved but lastProgrammaticMove was a while ago (>700ms), treat as human move
+    if (!lastObservedPos) {
+      lastObservedPos = pos;
+      lastObservedAt = now;
+      return;
+    }
+
+    const dx = pos.x - lastObservedPos.x;
+    const dy = pos.y - lastObservedPos.y;
+    const changed = (dx !== 0) || (dy !== 0);
+
+    const dtMs = Math.max(1, now - (lastObservedAt || now));
+    const dtS = dtMs / 1000;
+    const dist = Math.hypot(dx, dy);
+    const speed = dist / dtS; // pixels / second
+
     const programmaticGap = now - (lastProgrammaticMove || 0);
-    if (changed && programmaticGap > 700) {
+
+    // Opposite-direction heuristic: compare movement vector vs screensaver velocity.
+    // Only valid when screensaverActive and screensaver has nonzero velocity.
+    let oppositeDir = false;
+    if (screensaverActive) {
+      const svx = ssState.vx || 0;
+      const svy = ssState.vy || 0;
+      const sMag = Math.hypot(svx, svy);
+      const mMag = Math.hypot(dx, dy);
+      if (sMag > 0 && mMag > 0) {
+        const dot = (svx * dx + svy * dy) / (sMag * mMag); // normalized dot
+        if (AGENT_DEBUG) dlog('[agent] opp-check dot', dot.toFixed(3), 'dist', dist, 'speed', Math.round(speed));
+        if (dot <= AGENT_SCREENSAVER_OPPOSITE_DOT && dist >= AGENT_SCREENSAVER_EXIT_DELTA) {
+          oppositeDir = true;
+        }
+      }
+    }
+
+    const largeJump = dist >= AGENT_SCREENSAVER_EXIT_DELTA;
+    const fastMove = speed >= AGENT_SCREENSAVER_EXIT_SPEED;
+    const programmaticOldEnough = programmaticGap > 700;
+
+    const isPhysical = changed && (programmaticOldEnough || largeJump || fastMove || oppositeDir);
+
+    if (isPhysical) {
       lastPhysicalMoveAt = now;
       if (screensaverActive) stopScreensaver('physical move detected');
+      if (AGENT_DEBUG) dlog('[agent] detected physical move', { dist, speed, programmaticGap, oppositeDir });
     }
+
     lastObservedPos = pos;
+    lastObservedAt = now;
   } catch (e) {
     if (AGENT_DEBUG) console.warn('[agent] sampleMouseMovement failed', e);
   }
@@ -289,12 +360,15 @@ async function startScreensaver() {
   const cur = await getCurrentPosFallback();
   ssState.x = cur.x;
   ssState.y = cur.y;
-  // choose small random velocity to look natural
-  ssState.vx = (Math.random() > 0.5 ? 1 : -1) * (2 + Math.floor(Math.random()*4));
-  ssState.vy = (Math.random() > 0.5 ? 1 : -1) * (2 + Math.floor(Math.random()*3));
+  // choose small random velocity to look natural (pixels per tick)
+  const baseVx = (2 + Math.floor(Math.random()*4));
+  const baseVy = (2 + Math.floor(Math.random()*3));
+  ssState.vx = (Math.random() > 0.5 ? 1 : -1) * baseVx;
+  ssState.vy = (Math.random() > 0.5 ? 1 : -1) * baseVy;
   screensaverActive = true;
   if (AGENT_DEBUG) console.log('[agent] screensaver START', ssState);
 
+  const tickMs = Math.max(1, Math.round(SS_TICK_S * 1000));
   ssTimer = setInterval(async () => {
     try {
       const w = Math.max(1, (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024);
@@ -319,7 +393,7 @@ async function startScreensaver() {
     } catch (e) {
       if (AGENT_DEBUG) console.error('[agent] screensaver tick error', e);
     }
-  }, SS_TICK_MS);
+  }, tickMs);
 }
 
 // stop screensaver
@@ -340,7 +414,7 @@ setInterval(async () => {
     // prefer not to start screensaver if a viewer recently controlled (they might be moving)
     const recentViewer = (now - (lastViewerControlAt || 0)) < 5000;
 
-    if (!screensaverActive && !recentViewer && (now - (lastPhysicalMoveAt || now)) >= INACTIVITY_MS) {
+    if (!screensaverActive && !recentViewer && (now - (lastPhysicalMoveAt || now)) >= Math.round(INACTIVITY_S * 1000)) {
       // start screensaver
       startScreensaver().catch(()=>{});
     }
@@ -348,6 +422,44 @@ setInterval(async () => {
     if (AGENT_DEBUG) console.warn('[agent] idle-check error', e);
   }
 }, 1000); // check each second
+
+/* -----------------------------
+   Hotkey: Ctrl + Alt + 1 to stop screensaver (terminal & TTY friendly)
+   ----------------------------- */
+// Terminal keypress listening using readline (best-effort). This will detect Ctrl+Alt+1 in most terminals.
+// Fallback: if key object doesn't provide alt/meta reliably, pressing Ctrl+1 (without alt) or any key will also stop (when debug).
+try {
+  const readline = require('readline');
+  readline.emitKeypressEvents(process.stdin);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+  process.stdin.on('keypress', (str, key) => {
+    try {
+      if (!key) return;
+      const isOne = key.name === '1';
+      const ctrl = !!key.ctrl;
+      // alt may be reported as 'alt' or 'meta' in different Node versions/platforms
+      const alt = !!key.alt || !!key.meta;
+      if (isOne && ctrl && alt) {
+        if (screensaverActive) {
+          stopScreensaver('hotkey (Ctrl+Alt+1)');
+          if (AGENT_DEBUG) console.log('[agent] hotkey pressed: Ctrl+Alt+1');
+        }
+      }
+      // helpful fallback: allow Ctrl+1 to stop if alt detection fails on some terminals
+      if (isOne && ctrl && !alt && AGENT_DEBUG) {
+        if (screensaverActive) {
+          stopScreensaver('hotkey fallback (Ctrl+1)');
+          if (AGENT_DEBUG) console.log('[agent] hotkey fallback: Ctrl+1');
+        }
+      }
+    } catch (e) {
+      if (AGENT_DEBUG) console.warn('[agent] hotkey handler error', e);
+    }
+  });
+} catch (e) {
+  if (AGENT_DEBUG) console.warn('[agent] terminal hotkey setup failed', e);
+}
 
 /* -----------------------------
    socket handling / control events
@@ -463,5 +575,3 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
 socket.on('disconnect', () => {
   if (AGENT_DEBUG) console.log('[agent] disconnected from server');
 });
-
-

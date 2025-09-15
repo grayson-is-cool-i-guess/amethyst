@@ -1,16 +1,24 @@
 // agent.js
-// modified to improve screensaver exit heuristics (opposite direction, speed, jump)
-// hotkey to stop screensaver: Ctrl + Alt + 1
-// timings configured in seconds via env vars for convenience
+// made by chatgpt
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
-const AGENT_DEBUG = process.env.AGENT_DEBUG === '1' || false;
-// sensitivity multiplier applied to pointer-lock deltas (client can also scale)
+
+const DEBUG = false;
+
+const CONFIG = {
+  screensaverEnabled: true,
+  inactivityS: 10,
+  tickS: 0.05,
+  exitDeltaPx: 18,
+  exitSpeedPxPerS: 800,
+  oppositeDotThreshold: -0.3,
+  programmaticIgnoreMs: 700,
+  panicHotkey: { ctrl: true, alt: true, key: '1' }
+};
 const AGENT_SENSITIVITY = Number(process.env.AGENT_SENSITIVITY || 1.0);
-// min ms between agent->server cursor broadcasts (throttle)
-const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16); // ~60Hz default (ms)
+const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16);
 
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
@@ -32,7 +40,7 @@ try {
   nutScreen = nut.screen;
   try { if (nutKeyboard && nutKeyboard.config) nutKeyboard.config.autoDelayMs = 0; } catch(e){}
   try { if (nutMouse && nutMouse.config) nutMouse.config.mouseSpeed = 100; } catch(e){}
-  if (AGENT_DEBUG) console.log('[agent] nut.js loaded — agent will perform input locally');
+  if (DEBUG) console.log('[agent] nut.js loaded — agent will perform input locally');
 } catch (e) {
   console.error('[agent] failed to load @nut-tree-fork/nut-js. Install it: npm i @nut-tree-fork/nut-js');
   console.error('[agent] full error:', e && e.message ? e.message : e);
@@ -66,7 +74,6 @@ function mapButton(b) {
   return nutButton.LEFT;
 }
 
-// cache screen size to avoid repeated OS calls
 let _cachedScreen = { w: 1024, h: 768 };
 async function refreshScreenSizeOnce() {
   try {
@@ -74,46 +81,33 @@ async function refreshScreenSizeOnce() {
       const w = await nutScreen.width();
       const h = await nutScreen.height();
       if (w && h) _cachedScreen = { w, h };
-      if (AGENT_DEBUG) console.info('[agent] cached screen size', _cachedScreen);
+      if (DEBUG) console.info('[agent] cached screen size', _cachedScreen);
     }
-  } catch (e) { if (AGENT_DEBUG) console.warn('[agent] refreshScreenSize failed', e); }
+  } catch (e) { if (DEBUG) console.warn('[agent] refreshScreenSize failed', e); }
 }
-
-// periodically refresh screen size in case resolution/monitor changes
 setInterval(()=>{ refreshScreenSizeOnce().catch(()=>{}); }, 15_000);
 
-// agent-mouse emit throttle (ms) to reduce network pressure while keeping local movement immediate
 let _lastAgentEmitAt = 0;
-
-/**
- * Emit normalized cursor to server (throttled).
- * code is ROOM.
- */
 function emitAgentMouseNormalized(x, y) {
   try {
     const now = Date.now();
     if (socket && socket.connected && (now - _lastAgentEmitAt) >= AGENT_MOUSE_EMIT_MIN_MS) {
-      // clamp to [0,1] and send
       const nx = Math.max(0, Math.min(1, x));
       const ny = Math.max(0, Math.min(1, y));
       socket.emit('agent-mouse', { code: ROOM, xNorm: Number(nx) || 0, yNorm: Number(ny) || 0 });
       _lastAgentEmitAt = now;
-      if (AGENT_DEBUG) dlog('[agent] emit agent-mouse', nx, ny);
+      if (DEBUG) console.debug('[agent] emit agent-mouse', nx, ny);
     }
   } catch (e) {
-    if (AGENT_DEBUG) console.error('[agent] emit agent-mouse failed', e);
+    if (DEBUG) console.error('[agent] emit agent-mouse failed', e);
   }
 }
 
-function dlog(...a){ if(AGENT_DEBUG) console.debug('[agent dbg]', ...a); }
+function dlog(...a){ if(DEBUG) console.debug('[agent dbg]', ...a); }
 
-/**
- * Move OS cursor to absolute normalized position (existing behavior).
- */
 async function moveMouseForPayload(xNorm, yNorm) {
   try {
     if (!nutMouse) return;
-    // use cached screen size (cheaper)
     const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
     const h = (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768;
     const x = Math.round(Math.max(0, Math.min(1, xNorm)) * (w - 1));
@@ -123,50 +117,33 @@ async function moveMouseForPayload(xNorm, yNorm) {
     } else if (typeof nutMouse.move === 'function') {
       await nutMouse.move({ x, y });
     }
-
-    // mark programmatic move
     lastProgrammaticMove = Date.now();
-
-    // Throttle emits: move local cursor immediately, but only broadcast position at limited rate
     emitAgentMouseNormalized(x / Math.max(1, w - 1), y / Math.max(1, h - 1));
   } catch (e) {
-    if (AGENT_DEBUG) console.error('[agent] moveMouseForPayload failed', e);
+    if (DEBUG) console.error('[agent] moveMouseForPayload failed', e);
   }
 }
 
-/**
- * Move OS cursor by relative delta (pointer-lock / game mode).
- * dx/dy are device deltas (integers). We apply sensitivity and clamp to screen edges.
- */
 async function moveMouseRelative(dx, dy) {
   try {
     if (!nutMouse) return;
-    // ensure cached screen size reasonably fresh
     await refreshScreenSizeOnce().catch(()=>{});
-
     const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
     const h = (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768;
-
-    // get current OS cursor position; fallback to center
     let pos = { x: Math.floor(w / 2), y: Math.floor(h / 2) };
     try {
       if (typeof nutMouse.getPosition === 'function') {
         const p = await nutMouse.getPosition();
-        // nut.js historically returns {x,y} — handle arrays/other shapes defensively
         if (p && typeof p === 'object' && typeof p.x === 'number' && typeof p.y === 'number') {
           pos = { x: Math.round(p.x), y: Math.round(p.y) };
         } else if (Array.isArray(p) && p.length >= 2) {
           pos = { x: Math.round(p[0]), y: Math.round(p[1]) };
         }
       }
-    } catch (e) {
-      if (AGENT_DEBUG) dlog('[agent] getPosition fallback', e && e.message ? e.message : e);
-    }
+    } catch (e) { if (DEBUG) dlog('[agent] getPosition fallback', e && e.message ? e.message : e); }
 
-    // apply sensitivity and integer rounding
     const sx = Math.trunc(Math.round(Number(dx || 0) * AGENT_SENSITIVITY));
     const sy = Math.trunc(Math.round(Number(dy || 0) * AGENT_SENSITIVITY));
-
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v|0));
     const newX = clamp(pos.x + sx, 0, w - 1);
     const newY = clamp(pos.y + sy, 0, h - 1);
@@ -177,14 +154,11 @@ async function moveMouseRelative(dx, dy) {
       await nutMouse.move({ x: newX, y: newY });
     }
 
-    // mark programmatic move
     lastProgrammaticMove = Date.now();
-
-    // broadcast normalized cursor (throttled) so viewers receive instant cursor feedback
     emitAgentMouseNormalized(newX / Math.max(1, w - 1), newY / Math.max(1, h - 1));
-    if (AGENT_DEBUG) dlog('[agent] moved relative', dx, dy, '->', newX, newY);
+    if (DEBUG) dlog('[agent] moved relative', dx, dy, '->', newX, newY);
   } catch (e) {
-    if (AGENT_DEBUG) console.error('[agent] moveMouseRelative failed', e);
+    if (DEBUG) console.error('[agent] moveMouseRelative failed', e);
   }
 }
 
@@ -199,13 +173,13 @@ async function mouseClickPayload(buttonName) {
       await nutMouse.pressButton(b);
       await nutMouse.releaseButton(b);
     }
-  } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseClick failed', e); }
+  } catch (e) { if (DEBUG) console.error('[agent] mouseClick failed', e); }
 }
 async function mouseDownPayload(buttonName) {
-  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.pressButton === 'function') await nutMouse.pressButton(b); } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseDown failed', e); }
+  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.pressButton === 'function') await nutMouse.pressButton(b); } catch (e) { if (DEBUG) console.error('[agent] mouseDown failed', e); }
 }
 async function mouseUpPayload(buttonName) {
-  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.releaseButton === 'function') await nutMouse.releaseButton(b); } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseUp failed', e); }
+  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.releaseButton === 'function') await nutMouse.releaseButton(b); } catch (e) { if (DEBUG) console.error('[agent] mouseUp failed', e); }
 }
 async function mouseScrollPayload(dx, dy) {
   try {
@@ -219,41 +193,16 @@ async function mouseScrollPayload(dx, dy) {
       if (dx > 0 && typeof nutMouse.scrollRight === 'function') return nutMouse.scrollRight(Math.abs(dx));
       if (dx < 0 && typeof nutMouse.scrollLeft === 'function') return nutMouse.scrollLeft(Math.abs(dx));
     }
-  } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseScroll failed', e); }
+  } catch (e) { if (DEBUG) console.error('[agent] mouseScroll failed', e); }
 }
 
-/* -----------------------------
-   Screensaver / idle detection
-   -----------------------------
-   - Improved heuristics:
-     * If user moves mouse opposite to screensaver velocity with a large jump -> treat as human
-     * If user moves mouse very fast (speed threshold) -> treat as human
-     * If user jumps the cursor (large distance in one sample) -> treat as human
-   - Timings are provided in seconds via env vars for convenience.
-*/
-
-const AGENT_SCREENSAVER_DISABLE = process.env.AGENT_SCREENSAVER_DISABLE === '1'; // set to '1' to disable screensaver
-// inactivity time (seconds). Default: 180s (3 minutes). Set AGENT_SCREENSAVER_INACTIVITY_S
-
-
-
-
-
-const TIMETHINGY = 5;
-
-
-
-
-
-const INACTIVITY_S = AGENT_SCREENSAVER_DISABLE ? Number.POSITIVE_INFINITY : TIMETHINGY;
-// tick period for screensaver movement (seconds). Default 0.05 (50ms). Set AGENT_SCREENSAVER_TICK_S
-const SS_TICK_S = Number(process.env.AGENT_SCREENSAVER_TICK_S || 0.05);
-// exit delta (pixels) — single-sample jump over this many pixels triggers exit. Set AGENT_SCREENSAVER_EXIT_DELTA
-const AGENT_SCREENSAVER_EXIT_DELTA = Number(process.env.AGENT_SCREENSAVER_EXIT_DELTA || 18);
-// exit speed (pixels/second) — if movement speed exceeds this, treat as human. Set AGENT_SCREENSAVER_EXIT_SPEED
-const AGENT_SCREENSAVER_EXIT_SPEED = Number(process.env.AGENT_SCREENSAVER_EXIT_SPEED || 800);
-// used for opposite-direction detection: normalized dot threshold (negative -> opposite). Set AGENT_SCREENSAVER_OPPOSITE_DOT
-const AGENT_SCREENSAVER_OPPOSITE_DOT = Number(process.env.AGENT_SCREENSAVER_OPPOSITE_DOT || -0.3);
+const INACTIVITY_S = Number(CONFIG.inactivityS);
+const SS_TICK_S = Number(CONFIG.tickS);
+const AGENT_SCREENSAVER_EXIT_DELTA = Number(CONFIG.exitDeltaPx);
+const AGENT_SCREENSAVER_EXIT_SPEED = Number(CONFIG.exitSpeedPxPerS);
+const AGENT_SCREENSAVER_OPPOSITE_DOT = Number(CONFIG.oppositeDotThreshold);
+const PROGRAMMATIC_IGNORE_MS = Number(CONFIG.programmaticIgnoreMs);
+const SCREENSAVER_ALLOWED = Boolean(CONFIG.screensaverEnabled);
 
 let lastPhysicalMoveAt = Date.now();
 let lastProgrammaticMove = 0;
@@ -261,10 +210,9 @@ let lastObservedPos = null;
 let lastObservedAt = null;
 let screensaverActive = false;
 let ssTimer = null;
-let ssState = { x: 0, y: 0, vx: 3, vy: 2 }; // vx/vy are pixels per tick initially (we don't depend on absolute)
-let lastViewerControlAt = 0; // don't screensaver while viewers actively control
+let ssState = { x: 0, y: 0, vx: 3, vy: 2 };
+let lastViewerControlAt = 0;
 
-// read current OS cursor position (defensive)
 async function getCurrentPosFallback() {
   const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
   const h = (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768;
@@ -275,19 +223,11 @@ async function getCurrentPosFallback() {
       if (Array.isArray(p) && p.length >= 2) return { x: Math.round(p[0]), y: Math.round(p[1]) };
     }
   } catch (e) {
-    if (AGENT_DEBUG) dlog('[agent] getPosition error', e && e.message ? e.message : e);
+    if (DEBUG) dlog('[agent] getPosition error', e && e.message ? e.message : e);
   }
-  // fallback to center
   return { x: Math.floor(w/2), y: Math.floor(h/2) };
 }
 
-/**
- * Heuristics:
- * - if changed and programmaticGap > 700ms -> treat as physical (original behavior)
- * - OR if dist >= EXIT_DELTA_PIX -> treat as physical (jump)
- * - OR if speed >= EXIT_SPEED_PIX_PER_S -> treat as physical (fast)
- * - OR if movement direction is substantially opposite screensaver velocity and dist >= EXIT_DELTA_PIX -> treat as physical
- */
 async function sampleMouseMovement() {
   try {
     const pos = await getCurrentPosFallback();
@@ -305,12 +245,10 @@ async function sampleMouseMovement() {
     const dtMs = Math.max(1, now - (lastObservedAt || now));
     const dtS = dtMs / 1000;
     const dist = Math.hypot(dx, dy);
-    const speed = dist / dtS; // pixels / second
+    const speed = dist / dtS;
 
     const programmaticGap = now - (lastProgrammaticMove || 0);
 
-    // Opposite-direction heuristic: compare movement vector vs screensaver velocity.
-    // Only valid when screensaverActive and screensaver has nonzero velocity.
     let oppositeDir = false;
     if (screensaverActive) {
       const svx = ssState.vx || 0;
@@ -318,116 +256,97 @@ async function sampleMouseMovement() {
       const sMag = Math.hypot(svx, svy);
       const mMag = Math.hypot(dx, dy);
       if (sMag > 0 && mMag > 0) {
-        const dot = (svx * dx + svy * dy) / (sMag * mMag); // normalized dot
-        if (AGENT_DEBUG) dlog('[agent] opp-check dot', dot.toFixed(3), 'dist', dist, 'speed', Math.round(speed));
-        if (dot <= AGENT_SCREENSAVER_OPPOSITE_DOT && dist >= AGENT_SCREENSAVER_EXIT_DELTA) {
-          oppositeDir = true;
-        }
+        const dot = (svx * dx + svy * dy) / (sMag * mMag);
+        if (DEBUG) dlog('[agent] opp-check dot', dot.toFixed(3), 'dist', dist, 'speed', Math.round(speed));
+        if (dot <= AGENT_SCREENSAVER_OPPOSITE_DOT && dist >= AGENT_SCREENSAVER_EXIT_DELTA) oppositeDir = true;
       }
     }
 
     const largeJump = dist >= AGENT_SCREENSAVER_EXIT_DELTA;
     const fastMove = speed >= AGENT_SCREENSAVER_EXIT_SPEED;
-    const programmaticOldEnough = programmaticGap > 700;
+    const programmaticOldEnough = programmaticGap > PROGRAMMATIC_IGNORE_MS;
 
     const isPhysical = changed && (programmaticOldEnough || largeJump || fastMove || oppositeDir);
 
     if (isPhysical) {
       lastPhysicalMoveAt = now;
       if (screensaverActive) stopScreensaver('physical move detected');
-      if (AGENT_DEBUG) dlog('[agent] detected physical move', { dist, speed, programmaticGap, oppositeDir });
+      if (DEBUG) dlog('[agent] detected physical move', { dist, speed, programmaticGap, oppositeDir });
     }
 
     lastObservedPos = pos;
     lastObservedAt = now;
   } catch (e) {
-    if (AGENT_DEBUG) console.warn('[agent] sampleMouseMovement failed', e);
+    if (DEBUG) console.warn('[agent] sampleMouseMovement failed', e);
   }
 }
 
-// start screensaver movement loop
 async function startScreensaver() {
+  if (!SCREENSAVER_ALLOWED) { if (DEBUG) dlog('[agent] screensaver disabled by CONFIG'); return; }
   if (screensaverActive) return;
-  // avoid starting while viewers recently controlled
   const now = Date.now();
   if (now - lastViewerControlAt < 5000) {
-    if (AGENT_DEBUG) dlog('[agent] skipping screensaver: recent viewer control');
-    return;
+    if (DEBUG) dlog('[agent] skipping screensaver: recent viewer control'); return;
   }
 
-  const screen = (_cachedScreen && _cachedScreen.w && _cachedScreen.h) ? _cachedScreen : { w: 1024, h: 768 };
-  // choose start position near current pos
   const cur = await getCurrentPosFallback();
   ssState.x = cur.x;
   ssState.y = cur.y;
-  // choose small random velocity to look natural (pixels per tick)
   const baseVx = (2 + Math.floor(Math.random()*4));
   const baseVy = (2 + Math.floor(Math.random()*3));
   ssState.vx = (Math.random() > 0.5 ? 1 : -1) * baseVx;
   ssState.vy = (Math.random() > 0.5 ? 1 : -1) * baseVy;
   screensaverActive = true;
-  if (AGENT_DEBUG) console.log('[agent] screensaver START', ssState);
+  if (DEBUG) console.log('[agent] screensaver START', ssState);
 
   const tickMs = Math.max(1, Math.round(SS_TICK_S * 1000));
   ssTimer = setInterval(async () => {
     try {
       const w = Math.max(1, (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024);
       const h = Math.max(1, (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768);
-      // move
+
       ssState.x += ssState.vx;
       ssState.y += ssState.vy;
-      // bounce
+
       if (ssState.x <= 0) { ssState.x = 0; ssState.vx = -ssState.vx; }
       if (ssState.x >= w-1) { ssState.x = w-1; ssState.vx = -ssState.vx; }
       if (ssState.y <= 0) { ssState.y = 0; ssState.vy = -ssState.vy; }
       if (ssState.y >= h-1) { ssState.y = h-1; ssState.vy = -ssState.vy; }
-      // perform programmatic move
+
       if (typeof nutMouse.setPosition === 'function') {
         await nutMouse.setPosition({ x: Math.round(ssState.x), y: Math.round(ssState.y) });
       } else if (typeof nutMouse.move === 'function') {
         await nutMouse.move({ x: Math.round(ssState.x), y: Math.round(ssState.y) });
       }
       lastProgrammaticMove = Date.now();
-      // broadcast normalized cursor for viewers (throttled)
       emitAgentMouseNormalized(ssState.x / Math.max(1, w-1), ssState.y / Math.max(1, h-1));
     } catch (e) {
-      if (AGENT_DEBUG) console.error('[agent] screensaver tick error', e);
+      if (DEBUG) console.error('[agent] screensaver tick error', e);
     }
   }, tickMs);
 }
 
-// stop screensaver
 function stopScreensaver(reason) {
   if (!screensaverActive) return;
   screensaverActive = false;
   if (ssTimer) { clearInterval(ssTimer); ssTimer = null; }
-  if (AGENT_DEBUG) console.log('[agent] screensaver STOP', reason || '');
+  if (DEBUG) console.log('[agent] screensaver STOP', reason || '');
 }
 
-/* monitor idle -> start screensaver */
 setInterval(async () => {
   try {
-    // sample position to detect real movement
     await sampleMouseMovement();
-
     const now = Date.now();
-    // prefer not to start screensaver if a viewer recently controlled (they might be moving)
     const recentViewer = (now - (lastViewerControlAt || 0)) < 5000;
-
     if (!screensaverActive && !recentViewer && (now - (lastPhysicalMoveAt || now)) >= Math.round(INACTIVITY_S * 1000)) {
-      // start screensaver
+      if (DEBUG) dlog('[agent] inactivity threshold hit; starting screensaver');
       startScreensaver().catch(()=>{});
     }
   } catch (e) {
-    if (AGENT_DEBUG) console.warn('[agent] idle-check error', e);
+    if (DEBUG) console.warn('[agent] idle-check error', e);
   }
-}, 1000); // check each second
+}, 1000);
 
-/* -----------------------------
-   Hotkey: Ctrl + Alt + 1 to stop screensaver (terminal & TTY friendly)
-   ----------------------------- */
-// Terminal keypress listening using readline (best-effort). This will detect Ctrl+Alt+1 in most terminals.
-// Fallback: if key object doesn't provide alt/meta reliably, pressing Ctrl+1 (without alt) or any key will also stop (when debug).
 try {
   const readline = require('readline');
   readline.emitKeypressEvents(process.stdin);
@@ -436,86 +355,69 @@ try {
   process.stdin.on('keypress', (str, key) => {
     try {
       if (!key) return;
-      const isOne = key.name === '1';
+      const isOne = key.name === (CONFIG.panicHotkey.key || '1');
       const ctrl = !!key.ctrl;
-      // alt may be reported as 'alt' or 'meta' in different Node versions/platforms
       const alt = !!key.alt || !!key.meta;
-      if (isOne && ctrl && alt) {
+
+      const wantCtrl = Boolean(CONFIG.panicHotkey.ctrl);
+      const wantAlt = Boolean(CONFIG.panicHotkey.alt);
+
+      if (isOne && (!wantCtrl || ctrl) && (!wantAlt || alt)) {
         if (screensaverActive) {
-          stopScreensaver('hotkey (Ctrl+Alt+1)');
-          if (AGENT_DEBUG) console.log('[agent] hotkey pressed: Ctrl+Alt+1');
-        }
-      }
-      // helpful fallback: allow Ctrl+1 to stop if alt detection fails on some terminals
-      if (isOne && ctrl && !alt && AGENT_DEBUG) {
-        if (screensaverActive) {
-          stopScreensaver('hotkey fallback (Ctrl+1)');
-          if (AGENT_DEBUG) console.log('[agent] hotkey fallback: Ctrl+1');
+          stopScreensaver('hotkey (configured)');
+          if (DEBUG) console.log('[agent] hotkey pressed');
         }
       }
     } catch (e) {
-      if (AGENT_DEBUG) console.warn('[agent] hotkey handler error', e);
+      if (DEBUG) console.warn('[agent] hotkey handler error', e);
     }
   });
 } catch (e) {
-  if (AGENT_DEBUG) console.warn('[agent] terminal hotkey setup failed', e);
+  if (DEBUG) console.warn('[agent] terminal hotkey setup failed', e);
 }
 
-/* -----------------------------
-   socket handling / control events
-   ----------------------------*/
-
-// remember recent viewer control so screensaver doesn't fight live control
 socket.on('connect', () => {
-  if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
-  // refresh screen size once on connect
+  if (DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   refreshScreenSizeOnce().catch(()=>{});
   socket.emit('agent-register', { code: ROOM, secret: AGENT_SECRET }, (res) => {
     if (!res || !res.success) {
       console.error('[agent] agent-register failed', res);
       return;
     }
-    if (AGENT_DEBUG) console.log('[agent] agent registered for room', ROOM);
+    if (DEBUG) console.log('[agent] agent registered for room', ROOM);
   });
 });
 
-// Receive control forwarded from server (viewer actions)
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   try {
-    // Immediately note viewer control and stop any screensaver so control can take effect
     lastViewerControlAt = Date.now();
     if (screensaverActive) stopScreensaver('viewer control');
 
     if (!payload) return;
 
     if (payload.type === 'mouse') {
-      // RELATIVE (pointer-lock / game-mode): dx / dy integer deltas
       if (payload.action === 'relative') {
-        // accept either payload.dx/payload.dy or payload.deltaX/payload.deltaY
         const dx = Number(typeof payload.dx !== 'undefined' ? payload.dx : payload.deltaX || 0) || 0;
         const dy = Number(typeof payload.dy !== 'undefined' ? payload.dy : payload.deltaY || 0) || 0;
-        // apply relative move
-        moveMouseRelative(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] rel move error', e); });
+        moveMouseRelative(dx, dy).catch(e=>{ if (DEBUG) console.error('[agent] rel move error', e); });
         return;
       }
 
-      // ABSOLUTE normalized mapping (existing behavior)
       if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
-        // move OS mouse quickly, then emit agent-mouse (throttled) from moveMouseForPayload
-        moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move error', e); });
+        moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>{ if (DEBUG) console.error('[agent] move error', e); });
       } else if (payload.action === 'click') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseClickPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] click error', e); });
+        mouseClickPayload(btn).catch(e=>{ if (DEBUG) console.error('[agent] click error', e); });
       } else if (payload.action === 'down') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseDownPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mdown error', e); });
+        mouseDownPayload(btn).catch(e=>{ if (DEBUG) console.error('[agent] mdown error', e); });
       } else if (payload.action === 'up') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseUpPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mup error', e); });
+        mouseUpPayload(btn).catch(e=>{ if (DEBUG) console.error('[agent] mup error', e); });
       } else if (payload.action === 'scroll') {
         const dx = Math.trunc(payload.deltaX || 0);
         const dy = Math.trunc(payload.deltaY || 0);
-        mouseScrollPayload(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] scroll error', e); });
+        mouseScrollPayload(dx, dy).catch(e=>{ if (DEBUG) console.error('[agent] scroll error', e); });
       }
       return;
     }
@@ -523,12 +425,8 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
     if (payload.type === 'key') {
       const rawKey = (payload && payload.rawKey) ? String(payload.rawKey) : String(payload && payload.key || '');
       const lowKey = String((payload && payload.key) || rawKey || '').toLowerCase();
-      // make mapped mutable so we can normalize simple arrow names
       let mapped = lowKey;
       const MODIFIERS = new Set(['shift','control','ctrl','alt','meta','command','capslock']);
-
-      // Defensive: accept browser-style simple names ('left','right','up','down') as well
-      // as 'arrowleft' etc. Normalize to 'arrow*' because NUT_KEY_MAP uses 'arrowleft'.
       try {
         if (['left','right','up','down'].includes(mapped)) {
           mapped = 'arrow' + mapped;
@@ -539,11 +437,11 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
         const mappedKeyEnum = NUT_KEY_MAP[mapped];
         if (payload.action === 'down') {
           if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-            nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
+            nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (DEBUG) console.error('[agent] pressKey failed', e); });
           }
         } else if (payload.action === 'up') {
           if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-            nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] releaseKey failed', e); });
+            nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (DEBUG) console.error('[agent] releaseKey failed', e); });
           }
         }
         return;
@@ -552,27 +450,26 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
       const mappedKeyEnum = NUT_KEY_MAP[mapped];
       if (payload.action === 'down') {
         if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-          nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
+          nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (DEBUG) console.error('[agent] pressKey failed', e); });
         } else {
           const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
           if (toType && nutKeyboard && nutKeyboard.type) {
-            nutKeyboard.type(toType).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] type failed', e); });
+            nutKeyboard.type(toType).catch(e=>{ if (DEBUG) console.error('[agent] type failed', e); });
           }
         }
         return;
       } else if (payload.action === 'up') {
         if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-          nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] release failed', e); });
+          nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (DEBUG) console.error('[agent] release failed', e); });
         }
         return;
       }
     }
   } catch (err) {
-    if (AGENT_DEBUG) console.error('[agent] control-from-viewer handler error', err);
+    if (DEBUG) console.error('[agent] control-from-viewer handler error', err);
   }
 });
 
 socket.on('disconnect', () => {
-  if (AGENT_DEBUG) console.log('[agent] disconnected from server');
+  if (DEBUG) console.log('[agent] disconnected from server');
 });
-

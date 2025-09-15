@@ -1,7 +1,5 @@
 // agent.js
 // mostly made by gpt
-// clown on me idc
-
 // small performance & noise improvements (caching, emit-throttle, debug flag)
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
@@ -29,7 +27,6 @@ try {
   nutScreen = nut.screen;
   try { if (nutKeyboard && nutKeyboard.config) nutKeyboard.config.autoDelayMs = 0; } catch(e){}
   try { if (nutMouse && nutMouse.config) nutMouse.config.mouseSpeed = 100; } catch(e){}
-  console.log('[agent] nut.js loaded — agent will perform input locally');
   if (AGENT_DEBUG) console.log('[agent] nut.js loaded — agent will perform input locally');
 } catch (e) {
   console.error('[agent] failed to load @nut-tree-fork/nut-js. Install it: npm i @nut-tree-fork/nut-js');
@@ -84,8 +81,6 @@ let _lastAgentEmitAt = 0;
 async function moveMouseForPayload(xNorm, yNorm) {
   try {
     if (!nutMouse) return;
-    const w = (nutScreen && typeof nutScreen.width === 'function') ? await nutScreen.width() : 1024;
-    const h = (nutScreen && typeof nutScreen.height === 'function') ? await nutScreen.height() : 768;
     // use cached screen size (cheaper)
     const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
     const h = (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768;
@@ -97,21 +92,17 @@ async function moveMouseForPayload(xNorm, yNorm) {
       await nutMouse.move({ x, y });
     }
 
-    // Immediately inform server/viewers of the new cursor position so viewers can render it locally
     // Throttle emits: move local cursor immediately, but only broadcast position at limited rate
     try {
-      if (socket && socket.connected) {
       const now = Date.now();
       if (socket && socket.connected && (now - _lastAgentEmitAt) >= AGENT_MOUSE_EMIT_MIN_MS) {
         socket.emit('agent-mouse', { code: ROOM, xNorm: Number(xNorm) || 0, yNorm: Number(yNorm) || 0 });
         _lastAgentEmitAt = now;
       }
     } catch (e) {
-      console.error('[agent] emit agent-mouse failed', e);
       if (AGENT_DEBUG) console.error('[agent] emit agent-mouse failed', e);
     }
   } catch (e) {
-    console.error('[agent] moveMouseForPayload failed', e);
     if (AGENT_DEBUG) console.error('[agent] moveMouseForPayload failed', e);
   }
 }
@@ -127,15 +118,12 @@ async function mouseClickPayload(buttonName) {
       await nutMouse.pressButton(b);
       await nutMouse.releaseButton(b);
     }
-  } catch (e) { console.error('[agent] mouseClick failed', e); }
   } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseClick failed', e); }
 }
 async function mouseDownPayload(buttonName) {
-  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.pressButton === 'function') await nutMouse.pressButton(b); } catch (e) { console.error('[agent] mouseDown failed', e); }
   try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.pressButton === 'function') await nutMouse.pressButton(b); } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseDown failed', e); }
 }
 async function mouseUpPayload(buttonName) {
-  try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.releaseButton === 'function') await nutMouse.releaseButton(b); } catch (e) { console.error('[agent] mouseUp failed', e); }
   try { if (!nutMouse) return; const b = mapButton(buttonName); if (typeof nutMouse.releaseButton === 'function') await nutMouse.releaseButton(b); } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseUp failed', e); }
 }
 async function mouseScrollPayload(dx, dy) {
@@ -150,12 +138,10 @@ async function mouseScrollPayload(dx, dy) {
       if (dx > 0 && typeof nutMouse.scrollRight === 'function') return nutMouse.scrollRight(Math.abs(dx));
       if (dx < 0 && typeof nutMouse.scrollLeft === 'function') return nutMouse.scrollLeft(Math.abs(dx));
     }
-  } catch (e) { console.error('[agent] mouseScroll failed', e); }
   } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseScroll failed', e); }
 }
 
 socket.on('connect', () => {
-  console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   // refresh screen size once on connect
   refreshScreenSizeOnce().catch(()=>{});
@@ -164,7 +150,6 @@ socket.on('connect', () => {
       console.error('[agent] agent-register failed', res);
       return;
     }
-    console.log('[agent] agent registered for room', ROOM);
     if (AGENT_DEBUG) console.log('[agent] agent registered for room', ROOM);
   });
 });
@@ -174,26 +159,20 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
     if (!payload) return;
     if (payload.type === 'mouse') {
       if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
-        // move OS mouse, then emit agent-mouse in moveMouseForPayload -> viewers get near-instant cursor
-        moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>console.error('[agent] move error', e));
         // move OS mouse quickly, then emit agent-mouse (throttled) from moveMouseForPayload
         moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move error', e); });
       } else if (payload.action === 'click') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseClickPayload(btn).catch(e=>console.error('[agent] click error', e));
         mouseClickPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] click error', e); });
       } else if (payload.action === 'down') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseDownPayload(btn).catch(e=>console.error('[agent] mdown error', e));
         mouseDownPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mdown error', e); });
       } else if (payload.action === 'up') {
         const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseUpPayload(btn).catch(e=>console.error('[agent] mup error', e));
         mouseUpPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mup error', e); });
       } else if (payload.action === 'scroll') {
         const dx = Math.trunc(payload.deltaX || 0);
         const dy = Math.trunc(payload.deltaY || 0);
-        mouseScrollPayload(dx, dy).catch(e=>console.error('[agent] scroll error', e));
         mouseScrollPayload(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] scroll error', e); });
       }
       return;
@@ -218,12 +197,10 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
         const mappedKeyEnum = NUT_KEY_MAP[mapped];
         if (payload.action === 'down') {
           if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-            nutKeyboard.pressKey(mappedKeyEnum).catch(e=>console.error('[agent] pressKey failed', e));
             nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
           }
         } else if (payload.action === 'up') {
           if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-            nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>console.error('[agent] releaseKey failed', e));
             nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] releaseKey failed', e); });
           }
         }
@@ -233,31 +210,26 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
       const mappedKeyEnum = NUT_KEY_MAP[mapped];
       if (payload.action === 'down') {
         if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-          nutKeyboard.pressKey(mappedKeyEnum).catch(e=>console.error('[agent] pressKey failed', e));
           nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
         } else {
           const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
           if (toType && nutKeyboard && nutKeyboard.type) {
-            nutKeyboard.type(toType).catch(e=>console.error('[agent] type failed', e));
             nutKeyboard.type(toType).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] type failed', e); });
           }
         }
         return;
       } else if (payload.action === 'up') {
         if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-          nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>console.error('[agent] release failed', e));
           nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] release failed', e); });
         }
         return;
       }
     }
   } catch (err) {
-    console.error('[agent] control-from-viewer handler error', err);
     if (AGENT_DEBUG) console.error('[agent] control-from-viewer handler error', err);
   }
 });
 
 socket.on('disconnect', () => {
-  console.log('[agent] disconnected from server');
   if (AGENT_DEBUG) console.log('[agent] disconnected from server');
 });

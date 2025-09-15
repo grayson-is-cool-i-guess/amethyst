@@ -233,7 +233,7 @@ async function mouseScrollPayload(dx, dy) {
    - Screensaver moves cursor in bouncing pattern until user physically moves mouse.
    - We avoid treating our own programmatic moves as "physical" by tracking lastProgrammaticMove.
 */
-const INACTIVITY_MS = Number(process.env.AGENT_SCREENSAVER_INACTIVITY_MS || 180000); // 3 minutes default
+const INACTIVITY_MS = Number(process.env.AGENT_SCREENSAVER_INACTIVITY_MS || 5800); // 3 minutes default
 const SS_TICK_MS = Number(process.env.AGENT_SCREENSAVER_TICK_MS || 50); // movement tick
 let lastPhysicalMoveAt = Date.now();
 let lastProgrammaticMove = 0;
@@ -469,3 +469,4 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
 socket.on('disconnect', () => {
   if (AGENT_DEBUG) console.log('[agent] disconnected from server');
 });
+

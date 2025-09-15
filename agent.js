@@ -2,6 +2,7 @@
 // mostly made by gpt
 // small performance & noise improvements (caching, emit-throttle, debug flag)
 // + pointer-lock / relative mouse support
+// + automatic "DVD" screensaver on local idle
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
@@ -124,6 +125,9 @@ async function moveMouseForPayload(xNorm, yNorm) {
       await nutMouse.move({ x, y });
     }
 
+    // mark programmatic move
+    lastProgrammaticMove = Date.now();
+
     // Throttle emits: move local cursor immediately, but only broadcast position at limited rate
     emitAgentMouseNormalized(x / Math.max(1, w - 1), y / Math.max(1, h - 1));
   } catch (e) {
@@ -174,6 +178,9 @@ async function moveMouseRelative(dx, dy) {
       await nutMouse.move({ x: newX, y: newY });
     }
 
+    // mark programmatic move
+    lastProgrammaticMove = Date.now();
+
     // broadcast normalized cursor (throttled) so viewers receive instant cursor feedback
     emitAgentMouseNormalized(newX / Math.max(1, w - 1), newY / Math.max(1, h - 1));
     if (AGENT_DEBUG) dlog('[agent] moved relative', dx, dy, '->', newX, newY);
@@ -216,6 +223,140 @@ async function mouseScrollPayload(dx, dy) {
   } catch (e) { if (AGENT_DEBUG) console.error('[agent] mouseScroll failed', e); }
 }
 
+/* -----------------------------
+   Screensaver / idle detection
+   -----------------------------
+   - If no *physical* mouse movement for INACTIVITY_MS, start screensaver.
+   - Screensaver moves cursor in bouncing pattern until user physically moves mouse.
+   - We avoid treating our own programmatic moves as "physical" by tracking lastProgrammaticMove.
+*/
+const INACTIVITY_MS = Number(process.env.AGENT_SCREENSAVER_INACTIVITY_MS || 18000); // 3 minutes default
+const SS_TICK_MS = Number(process.env.AGENT_SCREENSAVER_TICK_MS || 50); // movement tick
+let lastPhysicalMoveAt = Date.now();
+let lastProgrammaticMove = 0;
+let lastObservedPos = null;
+let screensaverActive = false;
+let ssTimer = null;
+let ssState = { x: 0, y: 0, vx: 3, vy: 2 };
+let lastViewerControlAt = 0; // don't screensaver while viewers actively control
+
+// read current OS cursor position (defensive)
+async function getCurrentPosFallback() {
+  const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
+  const h = (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768;
+  try {
+    if (typeof nutMouse.getPosition === 'function') {
+      const p = await nutMouse.getPosition();
+      if (p && typeof p === 'object' && typeof p.x === 'number' && typeof p.y === 'number') return { x: Math.round(p.x), y: Math.round(p.y) };
+      if (Array.isArray(p) && p.length >= 2) return { x: Math.round(p[0]), y: Math.round(p[1]) };
+    }
+  } catch (e) {
+    if (AGENT_DEBUG) dlog('[agent] getPosition error', e && e.message ? e.message : e);
+  }
+  // fallback to center
+  return { x: Math.floor(w/2), y: Math.floor(h/2) };
+}
+
+// sample physical mouse movement periodically
+async function sampleMouseMovement() {
+  try {
+    const pos = await getCurrentPosFallback();
+    if (!lastObservedPos) { lastObservedPos = pos; return; }
+    // if position changed and it was not caused by our programmatic move, consider physical
+    const changed = (pos.x !== lastObservedPos.x) || (pos.y !== lastObservedPos.y);
+    const now = Date.now();
+    // if moved but lastProgrammaticMove was a while ago (>700ms), treat as human move
+    const programmaticGap = now - (lastProgrammaticMove || 0);
+    if (changed && programmaticGap > 700) {
+      lastPhysicalMoveAt = now;
+      if (screensaverActive) stopScreensaver('physical move detected');
+    }
+    lastObservedPos = pos;
+  } catch (e) {
+    if (AGENT_DEBUG) console.warn('[agent] sampleMouseMovement failed', e);
+  }
+}
+
+// start screensaver movement loop
+async function startScreensaver() {
+  if (screensaverActive) return;
+  // avoid starting while viewers recently controlled
+  const now = Date.now();
+  if (now - lastViewerControlAt < 5000) {
+    if (AGENT_DEBUG) dlog('[agent] skipping screensaver: recent viewer control');
+    return;
+  }
+
+  const screen = (_cachedScreen && _cachedScreen.w && _cachedScreen.h) ? _cachedScreen : { w: 1024, h: 768 };
+  // choose start position near current pos
+  const cur = await getCurrentPosFallback();
+  ssState.x = cur.x;
+  ssState.y = cur.y;
+  // choose small random velocity to look natural
+  ssState.vx = (Math.random() > 0.5 ? 1 : -1) * (2 + Math.floor(Math.random()*4));
+  ssState.vy = (Math.random() > 0.5 ? 1 : -1) * (2 + Math.floor(Math.random()*3));
+  screensaverActive = true;
+  if (AGENT_DEBUG) console.log('[agent] screensaver START', ssState);
+
+  ssTimer = setInterval(async () => {
+    try {
+      const w = Math.max(1, (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024);
+      const h = Math.max(1, (_cachedScreen && _cachedScreen.h) ? _cachedScreen.h : 768);
+      // move
+      ssState.x += ssState.vx;
+      ssState.y += ssState.vy;
+      // bounce
+      if (ssState.x <= 0) { ssState.x = 0; ssState.vx = -ssState.vx; }
+      if (ssState.x >= w-1) { ssState.x = w-1; ssState.vx = -ssState.vx; }
+      if (ssState.y <= 0) { ssState.y = 0; ssState.vy = -ssState.vy; }
+      if (ssState.y >= h-1) { ssState.y = h-1; ssState.vy = -ssState.vy; }
+      // perform programmatic move
+      if (typeof nutMouse.setPosition === 'function') {
+        await nutMouse.setPosition({ x: Math.round(ssState.x), y: Math.round(ssState.y) });
+      } else if (typeof nutMouse.move === 'function') {
+        await nutMouse.move({ x: Math.round(ssState.x), y: Math.round(ssState.y) });
+      }
+      lastProgrammaticMove = Date.now();
+      // broadcast normalized cursor for viewers (throttled)
+      emitAgentMouseNormalized(ssState.x / Math.max(1, w-1), ssState.y / Math.max(1, h-1));
+    } catch (e) {
+      if (AGENT_DEBUG) console.error('[agent] screensaver tick error', e);
+    }
+  }, SS_TICK_MS);
+}
+
+// stop screensaver
+function stopScreensaver(reason) {
+  if (!screensaverActive) return;
+  screensaverActive = false;
+  if (ssTimer) { clearInterval(ssTimer); ssTimer = null; }
+  if (AGENT_DEBUG) console.log('[agent] screensaver STOP', reason || '');
+}
+
+/* monitor idle -> start screensaver */
+setInterval(async () => {
+  try {
+    // sample position to detect real movement
+    await sampleMouseMovement();
+
+    const now = Date.now();
+    // prefer not to start screensaver if a viewer recently controlled (they might be moving)
+    const recentViewer = (now - (lastViewerControlAt || 0)) < 5000;
+
+    if (!screensaverActive && !recentViewer && (now - (lastPhysicalMoveAt || now)) >= INACTIVITY_MS) {
+      // start screensaver
+      startScreensaver().catch(()=>{});
+    }
+  } catch (e) {
+    if (AGENT_DEBUG) console.warn('[agent] idle-check error', e);
+  }
+}, 1000); // check each second
+
+/* -----------------------------
+   socket handling / control events
+   ----------------------------*/
+
+// remember recent viewer control so screensaver doesn't fight live control
 socket.on('connect', () => {
   if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   // refresh screen size once on connect
@@ -229,8 +370,10 @@ socket.on('connect', () => {
   });
 });
 
+// Receive control forwarded from server (viewer actions)
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   try {
+    lastViewerControlAt = Date.now(); // note: viewer is controlling, avoid screensaver
     if (!payload) return;
 
     if (payload.type === 'mouse') {

@@ -2,13 +2,18 @@
 // made by chatgpt
 // idc
 
-
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
 const AGENT_DEBUG = process.env.AGENT_DEBUG === '1' || false;
 const AGENT_SENSITIVITY = Number(process.env.AGENT_SENSITIVITY || 1.0);
 const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16);
+
+// Agent-register retry/backoff config
+const AGENT_REGISTER_BASE_MS = Number(process.env.AGENT_REGISTER_BASE_MS || 1000); // initial backoff
+const AGENT_REGISTER_MAX_MS = Number(process.env.AGENT_REGISTER_MAX_MS || 60000); // max backoff
+const AGENT_REGISTER_JITTER = Number(process.env.AGENT_REGISTER_JITTER || 0.2); // fraction ± jitter
+const AGENT_REGISTER_MAX_RETRIES = Number(process.env.AGENT_REGISTER_MAX_RETRIES || 0); // 0 = infinite
 
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
@@ -295,18 +300,92 @@ setInterval(async () => {
   }
 }, 1000);
 
+// ---- Agent-register retry logic ----
+let _registerAttempts = 0;
+let _registered = false;
+let _registerTimer = null;
+
+function _computeBackoffMs(attempt) {
+  const raw = Math.min(AGENT_REGISTER_BASE_MS * Math.pow(2, attempt), AGENT_REGISTER_MAX_MS);
+  // jitter ±AGENT_REGISTER_JITTER
+  const jitter = (Math.random() * 2 - 1) * AGENT_REGISTER_JITTER;
+  const withJitter = Math.max(0, Math.floor(raw * (1 + jitter)));
+  return withJitter;
+}
+
+function _scheduleRegisterRetry(reason) {
+  if (AGENT_REGISTER_MAX_RETRIES > 0 && _registerAttempts >= AGENT_REGISTER_MAX_RETRIES) {
+    if (AGENT_DEBUG) console.warn('[agent] reached max register retries, giving up:', _registerAttempts);
+    return;
+  }
+  const delay = _computeBackoffMs(_registerAttempts);
+  if (AGENT_DEBUG) console.info('[agent] schedule register retry', { attempt: _registerAttempts, delay, reason });
+  if (_registerTimer) clearTimeout(_registerTimer);
+  _registerTimer = setTimeout(() => {
+    if (socket && socket.connected) {
+      _doRegister();
+    } else {
+      // wait until connected event
+      if (AGENT_DEBUG) dlog('[agent] socket not connected yet — will register on connect');
+    }
+  }, delay);
+}
+
+function _doRegister() {
+  if (_registered) return;
+  _registerAttempts++;
+  if (AGENT_DEBUG) console.info('[agent] attempting agent-register', { attempt: _registerAttempts, room: ROOM });
+  try {
+    socket.emit('agent-register', { code: ROOM, secret: AGENT_SECRET }, (res) => {
+      if (res && res.success) {
+        _registered = true;
+        _registerAttempts = 0;
+        if (_registerTimer) { clearTimeout(_registerTimer); _registerTimer = null; }
+        if (AGENT_DEBUG) console.log('[agent] registered for room', ROOM);
+        return;
+      }
+      // registration failed — schedule retry
+      if (AGENT_DEBUG) console.warn('[agent] agent-register failed', res);
+      _scheduleRegisterRetry(res && res.error ? res.error : 'no-response');
+    });
+  } catch (e) {
+    if (AGENT_DEBUG) console.error('[agent] emit agent-register failed', e);
+    _scheduleRegisterRetry(e && e.message ? e.message : 'emit-failed');
+  }
+}
+
+// Ensure we attempt registration when connected and retry on failures/disconnects
 socket.on('connect', () => {
   if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   refreshScreenSizeOnce().catch(()=>{});
-  socket.emit('agent-register', { code: ROOM, secret: AGENT_SECRET }, (res) => {
-    if (!res || !res.success) {
-      console.error('[agent] agent-register failed', res);
-      return;
-    }
-    if (AGENT_DEBUG) console.log('[agent] agent registered for room', ROOM);
-  });
+  if (!_registered) {
+    // reset attempts only if starting fresh after a disconnect
+    // (do not reset if we're already in retry loop and haven't succeeded)
+    if (_registerTimer) { clearTimeout(_registerTimer); _registerTimer = null; }
+    // attempt immediately
+    _doRegister();
+  } else {
+    if (AGENT_DEBUG) dlog('[agent] already registered — reconnected');
+  }
 });
 
+socket.on('disconnect', (reason) => {
+  if (AGENT_DEBUG) console.log('[agent] disconnected from server', reason);
+  // mark not-registered so we will re-register on reconnect
+  _registered = false;
+  // schedule immediate retry only when socket reconnects (handled in 'connect')
+});
+
+// If we receive an explicit 'agent-register failed room not found' while connected,
+// ensure we retry (this covers any edge cases where server responds async).
+// Note: server's callback is handled above, but keep this listener defensive.
+socket.on('agent-register-failed', (info) => {
+  if (AGENT_DEBUG) console.warn('[agent] server-side agent-register-failed event', info);
+  _registered = false;
+  _scheduleRegisterRetry(info && info.error ? info.error : 'agent-register-failed-event');
+});
+
+// ---- control-from-viewer handler (unchanged) ----
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   try {
     lastViewerControlAt = Date.now();
@@ -383,8 +462,11 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   }
 });
 
-socket.on('disconnect', () => {
-  if (AGENT_DEBUG) console.log('[agent] disconnected from server');
+// defensive: if server asks us to register again, reset and try
+socket.on('request-agent-register', () => {
+  if (AGENT_DEBUG) console.info('[agent] server requested agent-register; re-attempting');
+  _registered = false;
+  _doRegister();
 });
 
 try {
@@ -398,5 +480,3 @@ try {
 } catch (e) {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
-
-

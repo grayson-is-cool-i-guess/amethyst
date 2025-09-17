@@ -110,9 +110,10 @@ async function moveMouseForPayload(xNorm, yNorm) {
     const x = Math.round(Math.max(0, Math.min(1, xNorm)) * (w - 1));
     const y = Math.round(Math.max(0, Math.min(1, yNorm)) * (h - 1));
     if (typeof nutMouse.setPosition === 'function') {
-      await nutMouse.setPosition({ x, y });
+      // fire-and-forget to avoid awaiting nut-js internal delays
+      try { nutMouse.setPosition({ x, y }).catch && nutMouse.setPosition({ x, y }).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] setPosition err', e); }); } catch(e){ try{ nutMouse.setPosition({ x, y }); }catch(e2){} }
     } else if (typeof nutMouse.move === 'function') {
-      await nutMouse.move({ x, y });
+      try { nutMouse.move({ x, y }).catch && nutMouse.move({ x, y }).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move err', e); }); } catch(e){ try{ nutMouse.move({ x, y }); }catch(e2){} }
     }
     lastProgrammaticMove = Date.now();
     emitAgentMouseNormalized(x / Math.max(1, w - 1), y / Math.max(1, h - 1));

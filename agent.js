@@ -387,6 +387,9 @@ socket.on('agent-register-failed', (info) => {
 
 // ---- control-from-viewer handler (unchanged) ----
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
+  if (AGENT_DEBUG) console.log('[agent] control-from-viewer received', { fromViewer, payload });
+  if (!nut) { console.warn('[agent] nut-js not loaded; input operations will fail'); }
+
   try {
     lastViewerControlAt = Date.now();
     if (screensaverActive) stopScreensaver('viewer control');

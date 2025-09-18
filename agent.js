@@ -5,7 +5,7 @@
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
-const AGENT_DEBUG = process.env.AGENT_DEBUG === '1' || false;
+const AGENT_DEBUG = true;
 const AGENT_SENSITIVITY = Number(process.env.AGENT_SENSITIVITY || 1.0);
 const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16);
 
@@ -58,6 +58,16 @@ if (nutKey) {
   tryAssign('enter','Enter'); tryAssign('return','Enter'); tryAssign('backspace','Backspace'); tryAssign('tab','Tab'); tryAssign('escape','Escape'); tryAssign('space','Space'); tryAssign('delete','Delete');
   tryAssign('home','Home'); tryAssign('end','End'); tryAssign('pageup','PageUp'); tryAssign('pagedown','PageDown'); tryAssign('insert','Insert');
   tryAssign('arrowleft','LeftArrow'); tryAssign('arrowright','RightArrow'); tryAssign('arrowup','UpArrow'); tryAssign('arrowdown','DownArrow');
+  // replace the existing arrow tryAssign lines with this block:
+tryAssign('arrowleft','ArrowLeft');   // common enum name
+tryAssign('arrowleft','LeftArrow');   // fallback
+tryAssign('arrowright','ArrowRight');
+tryAssign('arrowright','RightArrow');
+tryAssign('arrowup','ArrowUp');
+tryAssign('arrowup','UpArrow');
+tryAssign('arrowdown','ArrowDown');
+tryAssign('arrowdown','DownArrow');
+
   tryAssign('printscreen','PrintScreen'); tryAssign('pause','Pause'); tryAssign('scrolllock','ScrollLock'); tryAssign('numlock','NumLock');
   tryAssign('f1','F1'); tryAssign('f2','F2'); tryAssign('f3','F3'); tryAssign('f4','F4'); tryAssign('f5','F5'); tryAssign('f6','F6'); tryAssign('f7','F7'); tryAssign('f8','F8'); tryAssign('f9','F9'); tryAssign('f10','F10'); tryAssign('f11','F11'); tryAssign('f12','F12');
 }
@@ -484,3 +494,4 @@ try {
 } catch (e) {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
+

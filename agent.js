@@ -439,15 +439,41 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
       } catch(e){}
       if (MODIFIERS.has(mapped)) {
         const mappedKeyEnum = NUT_KEY_MAP[mapped];
-        if (payload.action === 'down') {
-          if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-            nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
-          }
-        } else if (payload.action === 'up') {
-          if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-            nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] releaseKey failed', e); });
-          }
-        }
+// replace the current 'down'/'up' handling block with this improved one
+try {
+  if (payload.action === 'down') {
+    if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
+      // preferred: press (hold)
+      nutKeyboard.pressKey(mappedKeyEnum).catch(e => { console.error('[agent] pressKey failed', e); });
+    } else if (mappedKeyEnum && nutKeyboard && nutKeyboard.tapKey) {
+      // tapKey exists but pressKey doesn't — use tap as fallback
+      nutKeyboard.tapKey(mappedKeyEnum).catch(e => { console.error('[agent] tapKey (fallback) failed', e); });
+    } else if (mapped === 'escape' && nutKey && (nutKey.Escape || nutKey.Esc) && nutKeyboard && nutKeyboard.tapKey) {
+      // explicit escape fallback (kept from existing)
+      const escEnum = nutKey.Escape || nutKey.Esc;
+      nutKeyboard.tapKey(escEnum).catch(e => { console.warn('[agent] tapKey fallback failed', e); });
+    } else {
+      // final fallback to typing a character when appropriate
+      const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
+      if (toType && nutKeyboard && nutKeyboard.type) {
+        nutKeyboard.type(toType).catch(e => { console.error('[agent] type fallback failed', e); });
+      } else {
+        console.warn('[agent] no key mapping or method found for', mapped, rawKey);
+      }
+    }
+    return;
+  } else if (payload.action === 'up') {
+    if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
+      nutKeyboard.releaseKey(mappedKeyEnum).catch(e => { console.error('[agent] releaseKey failed', e); });
+    } else {
+      // if no releaseKey, give a clear debug log so we can see this situation
+      console.debug('[agent] releaseKey not available for', mapped);
+    }
+    return;
+  }
+} catch (err) {
+  console.error('[agent] key handler error', err);
+}
         return;
       }
       const mappedKeyEnum = NUT_KEY_MAP[mapped];
@@ -491,5 +517,6 @@ try {
 } catch (e) {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
+
 
 

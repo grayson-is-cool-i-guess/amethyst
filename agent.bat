@@ -1,3 +1,8 @@
+:: agent that automates everything
+:: also made with AI
+:: im super cool for using ai right guys
+
+
 @echo off
 setlocal enabledelayedexpansion
 
@@ -44,5 +49,6 @@ start cmd /k "set ROOM_CODE=%ROOM_CODE%&& set SERVER_URL=%SERVER_URL%&& node age
 
 pause
 exit /b
+
 
 

@@ -356,6 +356,8 @@ function _doRegister() {
   }
 }
 
+setInterval(()=>{ try{ socket.emit('agent-heartbeat', { t: Date.now() }); }catch(_){} }, 10000);
+
 socket.on('connect', () => {
   if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   refreshScreenSizeOnce().catch(()=>{});
@@ -505,4 +507,10 @@ try {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
 
-try{ setInterval(()=>{ try{ socket.emit('agent-heartbeat', { t: Date.now() }); }catch(e){} }, 10000); }catch(e){}
+try {
+  socket.on('request-keyframe', (data)=>{
+    try { console.log('[agent] request-keyframe received', data); } catch(_){}
+    try { if (typeof forceKeyframe === 'function') forceKeyframe(); } catch(_){}
+    try { socket.emit('agent-log', { level:'info', msg:'request-keyframe received' }); } catch(_){}
+  });
+} catch(_){}

@@ -31,6 +31,8 @@ async function initEnv() {
   console.log(`[agent] configured with SERVER_URL=${server} ROOM_CODE=${room}`);
 }
 
+console.log(`tuff mcsigma`);
+
 await initEnv();
 
 
@@ -557,5 +559,6 @@ try {
     try { socket.emit('agent-log', { level:'info', msg:'request-keyframe received' }); } catch(_){}
   });
 } catch(_){}
+
 
 

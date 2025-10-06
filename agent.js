@@ -1,9 +1,3 @@
-// agent.js
-// made by chatgpt
-
-
-
-
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
@@ -510,3 +504,5 @@ try {
 } catch (e) {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
+
+try{ setInterval(()=>{ try{ socket.emit('agent-heartbeat', { t: Date.now() }); }catch(e){} }, 10000); }catch(e){}

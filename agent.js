@@ -1,3 +1,40 @@
+// === interactive startup ===
+const readline = require("readline");
+
+async function promptEnvVar(name, defaultValue = "") {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const msg = defaultValue ? `${name} [${defaultValue}]: ` : `${name}: `;
+    rl.question(msg, (ans) => {
+      rl.close();
+      resolve(ans.trim() || defaultValue);
+    });
+  });
+}
+
+async function initEnv() {
+  let server = process.env.SERVER_URL || "";
+  let room = process.env.ROOM_CODE || "";
+  let secret = process.env.AGENT_SECRET || null;
+
+  if (!server) server = await promptEnvVar("SERVER_URL", "https://streamamethyst.org");
+  if (!room) room = await promptEnvVar("ROOM_CODE");
+  if (!room) {
+    console.error("No room code provided — exiting.");
+    process.exit(1);
+  }
+
+  process.env.SERVER_URL = server;
+  process.env.ROOM_CODE = room;
+  process.env.AGENT_SECRET = secret;
+
+  console.log(`[agent] configured with SERVER_URL=${server} ROOM_CODE=${room}`);
+}
+
+await initEnv();
+
+
+
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
@@ -520,4 +557,5 @@ try {
     try { socket.emit('agent-log', { level:'info', msg:'request-keyframe received' }); } catch(_){}
   });
 } catch(_){}
+
 

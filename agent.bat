@@ -38,7 +38,16 @@ if not exist package.json npm init -y >nul 2>&1
 start cmd /k "cd /d %INSTALL_DIR% && npm install %AGENT_NPM_PACKAGES%"
 
 pause
-start cmd /k "node agent.js"
+
+set /p ROOM_CODE="Room ID: "
+if "%ROOM_CODE%"=="" exit /b
+
+set /p SERVER_URL="Server URL (default https://streamamethyst.org): "
+if "%SERVER_URL%"=="" set "SERVER_URL=https://streamamethyst.org"
+
+start cmd /k "set ROOM_CODE=%ROOM_CODE%&& set SERVER_URL=%SERVER_URL%&& node agent.js"
 
 pause
 exit /b
+
+

@@ -50,28 +50,10 @@ if errorlevel 1 (
     exit /b
 )
 
-echo.
-set /p ROOM_CODE=Room ID: 
-if "%ROOM_CODE%"=="" (
-    echo No Room ID provided. Exiting.
-    exit /b
-)
-
-REM === Set env vars and run agent in the SAME window ===
-set "ROOM_CODE=%ROOM_CODE%"
-set "SERVER_URL=https://streamamethyst.org"
-
-echo.
-echo Launching agent with:
-echo   INSTALL_DIR=%INSTALL_DIR%
-echo   ROOM_CODE=%ROOM_CODE%
-echo   SERVER_URL=%SERVER_URL%
-echo.
-
-REM If agent crashes, you will see the error here.
 node agent.js
 
 echo.
 echo Agent exited with code %errorlevel%.
 pause
 exit /b
+

@@ -1,15 +1,12 @@
-// === interactive startup ===
-const readline = require("readline");
+import readline from "node:readline";
+import { stdin as input, stdout as output } from "node:process";
 
 async function promptEnvVar(name, defaultValue = "") {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const msg = defaultValue ? `${name} [${defaultValue}]: ` : `${name}: `;
-    rl.question(msg, (ans) => {
-      rl.close();
-      resolve(ans.trim() || defaultValue);
-    });
-  });
+  const rl = readline.createInterface({ input, output });
+  const msg = defaultValue ? `${name} [${defaultValue}]: ` : `${name}: `;
+  const answer = await new Promise((resolve) => rl.question(msg, resolve));
+  rl.close();
+  return answer.trim() || defaultValue;
 }
 
 async function initEnv() {
@@ -31,10 +28,7 @@ async function initEnv() {
   console.log(`[agent] configured with SERVER_URL=${server} ROOM_CODE=${room}`);
 }
 
-console.log(`tuff mcsigma`);
-
 await initEnv();
-
 
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
@@ -559,6 +553,7 @@ try {
     try { socket.emit('agent-log', { level:'info', msg:'request-keyframe received' }); } catch(_){}
   });
 } catch(_){}
+
 
 
 

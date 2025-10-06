@@ -1,27 +1,15 @@
-// agent.js
-// made by chatgpt
-// idc
-
-const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
+const WebSocket = require('ws');
+const SERVER = process.env.SERVER_URL || 'wss://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
 const AGENT_SECRET = process.env.AGENT_SECRET || null;
 const AGENT_DEBUG = true;
 const AGENT_SENSITIVITY = Number(process.env.AGENT_SENSITIVITY || 1.0);
 const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16);
 
-// Agent-register retry/backoff config
-const AGENT_REGISTER_BASE_MS = Number(process.env.AGENT_REGISTER_BASE_MS || 1000); // initial backoff
-const AGENT_REGISTER_MAX_MS = Number(process.env.AGENT_REGISTER_MAX_MS || 60000); // max backoff
-const AGENT_REGISTER_JITTER = Number(process.env.AGENT_REGISTER_JITTER || 0.2); // fraction ± jitter
-const AGENT_REGISTER_MAX_RETRIES = Number(process.env.AGENT_REGISTER_MAX_RETRIES || 0); // 0 = infinite
-
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
   process.exit(1);
 }
-
-const io = require('socket.io-client');
-const socket = io(SERVER, { transports: ['websocket'] });
 
 let nutMouse = null, nutKeyboard = null, nutKey = null, nutButton = null, nutScreen = null;
 let nut = null;
@@ -58,14 +46,7 @@ if (nutKey) {
   tryAssign('enter','Enter'); tryAssign('return','Enter'); tryAssign('backspace','Backspace'); tryAssign('tab','Tab'); tryAssign('escape','Escape'); tryAssign('space','Space'); tryAssign('delete','Delete');
   tryAssign('home','Home'); tryAssign('end','End'); tryAssign('pageup','PageUp'); tryAssign('pagedown','PageDown'); tryAssign('insert','Insert');
   tryAssign('arrowleft','LeftArrow'); tryAssign('arrowright','RightArrow'); tryAssign('arrowup','UpArrow'); tryAssign('arrowdown','DownArrow');
-
-tryAssign('arrowleft','ArrowLeft');   tryAssign('arrowleft','LeftArrow');
-tryAssign('arrowright','ArrowRight'); tryAssign('arrowright','RightArrow');
-tryAssign('arrowup','ArrowUp');       tryAssign('arrowup','UpArrow');
-tryAssign('arrowdown','ArrowDown');   tryAssign('arrowdown','DownArrow');
-tryAssign('escape','Escape');         tryAssign('escape','Esc');
-
-  tryAssign('printscreen','PrintScreen'); tryAssign('pause','Pause'); tryAssign('scrolllock','ScrollLock'); tryAssign('numlock','NumLock');
+  tryAssign('escape','Escape'); tryAssign('printscreen','PrintScreen'); tryAssign('pause','Pause'); tryAssign('scrolllock','ScrollLock'); tryAssign('numlock','NumLock');
   tryAssign('f1','F1'); tryAssign('f2','F2'); tryAssign('f3','F3'); tryAssign('f4','F4'); tryAssign('f5','F5'); tryAssign('f6','F6'); tryAssign('f7','F7'); tryAssign('f8','F8'); tryAssign('f9','F9'); tryAssign('f10','F10'); tryAssign('f11','F11'); tryAssign('f12','F12');
 }
 
@@ -76,7 +57,230 @@ function mapButton(b) {
   return nutButton.LEFT;
 }
 
-let _cachedScreen = { w: 1024, h: 768 };
+function encodeBinaryFrame(type, meta, payloadArrayBuffer) {
+  const header = JSON.stringify(Object.assign({ type }, meta ? { meta } : {}));
+  const encoder = new TextEncoder();
+  const headerBytes = encoder.encode(header);
+  const headerLen = headerBytes.length;
+  const payload = payloadArrayBuffer || new ArrayBuffer(0);
+  const pview = (payload instanceof ArrayBuffer) ? new Uint8Array(payload) : (payload && payload.buffer instanceof ArrayBuffer ? new Uint8Array(payload.buffer) : new Uint8Array(0));
+  const out = new Uint8Array(1 + 4 + headerLen + pview.length);
+  out[0] = 0x01;
+
+  out[1] = (headerLen >>> 24) & 0xFF;
+  out[2] = (headerLen >>> 16) & 0xFF;
+  out[3] = (headerLen >>> 8) & 0xFF;
+  out[4] = (headerLen >>> 0) & 0xFF;
+  out.set(headerBytes, 5);
+  out.set(pview, 5 + headerLen);
+  return out.buffer;
+}
+
+let ws = null;
+let _registerAttempts = 0;
+let _registered = false;
+let _registerTimer = null;
+
+function dlog(...a){ if (AGENT_DEBUG) console.debug('[agent dbg]', ...a); }
+function scheduleRegisterRetry(reason) {
+  const AGENT_REGISTER_BASE_MS = Number(process.env.AGENT_REGISTER_BASE_MS || 1000);
+  const AGENT_REGISTER_MAX_MS = Number(process.env.AGENT_REGISTER_MAX_MS || 60000);
+  const AGENT_REGISTER_JITTER = Number(process.env.AGENT_REGISTER_JITTER || 0.2);
+  const AGENT_REGISTER_MAX_RETRIES = Number(process.env.AGENT_REGISTER_MAX_RETRIES || 0);
+  if (AGENT_REGISTER_MAX_RETRIES > 0 && _registerAttempts >= AGENT_REGISTER_MAX_RETRIES) {
+    if (AGENT_DEBUG) console.warn('[agent] reached max register retries, giving up:', _registerAttempts);
+    return;
+  }
+  const raw = Math.min(AGENT_REGISTER_BASE_MS * Math.pow(2, _registerAttempts), AGENT_REGISTER_MAX_MS);
+  const jitter = (Math.random() * 2 - 1) * AGENT_REGISTER_JITTER;
+  const delay = Math.max(0, Math.floor(raw * (1 + jitter)));
+  if (_registerTimer) clearTimeout(_registerTimer);
+  if (AGENT_DEBUG) console.info('[agent] schedule register retry', { attempt: _registerAttempts, delay, reason });
+  _registerTimer = setTimeout(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      doRegister();
+    } else {
+
+      if (AGENT_DEBUG) dlog('[agent] ws not open yet — will register on open');
+    }
+  }, delay);
+}
+
+function doRegister() {
+  if (_registered) return;
+  _registerAttempts++;
+  if (AGENT_DEBUG) console.info('[agent] attempting agent-register', { attempt: _registerAttempts, room: ROOM });
+  try {
+    sendJSON({ type: 'agent-register', code: ROOM, secret: AGENT_SECRET });
+  } catch (e) {
+    if (AGENT_DEBUG) console.error('[agent] send agent-register failed', e && e.message ? e.message : e);
+    scheduleRegisterRetry(e && e.message ? e.message : 'send-failed');
+  }
+}
+
+function sendJSON(obj) {
+  try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(obj));
+  } catch (e) { if (AGENT_DEBUG) console.error('[agent] sendJSON failed', e); }
+}
+
+function connect() {
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+  ws = new WebSocket(SERVER, { perMessageDeflate: false });
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER);
+    _registerAttempts = 0;
+    if (!_registered) doRegister();
+  };
+  ws.onmessage = (evt) => {
+    try {
+      const data = evt.data;
+      if (typeof data === 'string') {
+        const obj = JSON.parse(data);
+        handleJSONMessage(obj);
+      } else {
+        const buf = data;
+      }
+    } catch (e) {
+      if (AGENT_DEBUG) console.error('[agent] message parse error', e);
+    }
+  };
+  ws.onclose = (ev) => {
+    if (AGENT_DEBUG) console.log('[agent] disconnected', ev && ev.code);
+    _registered = false;
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = (e) => { if (AGENT_DEBUG) console.warn('[agent] ws error', e && e.message); };
+}
+
+function handleJSONMessage(obj) {
+  if (!obj || typeof obj.type !== 'string') return;
+  const t = obj.type;
+  if (t === 'agent-register-response') {
+    if (obj.success) {
+      _registered = true;
+      _registerAttempts = 0;
+      if (_registerTimer) { clearTimeout(_registerTimer); _registerTimer = null; }
+      if (AGENT_DEBUG) console.log('[agent] registered for room', ROOM);
+    } else {
+      _registered = false;
+      if (AGENT_DEBUG) console.warn('[agent] register failed', obj.error);
+      scheduleRegisterRetry(obj.error || 'register-failed');
+    }
+    return;
+  }
+
+  if (t === 'control-from-viewer') {
+    const { fromViewer, payload } = obj;
+    if (AGENT_DEBUG) console.log('[agent] control-from-viewer received', { fromViewer, payload });
+    if (!payload) return;
+    lastViewerControlAt = Date.now();
+    if (screensaverActive) stopScreensaver('viewer control');
+    (async ()=> {
+      try {
+        if (payload.type === 'mouse') {
+          if (payload.action === 'relative') {
+            const dx = Number(typeof payload.dx !== 'undefined' ? payload.dx : payload.deltaX || 0) || 0;
+            const dy = Number(typeof payload.dy !== 'undefined' ? payload.dy : payload.deltaY || 0) || 0;
+            moveMouseRelative(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] rel move error', e); });
+            return;
+          }
+          if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
+            moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move error', e); });
+          } else if (payload.action === 'click') {
+            const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
+            mouseClickPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] click error', e); });
+          } else if (payload.action === 'down') {
+            const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
+            mouseDownPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mdown error', e); });
+          } else if (payload.action === 'up') {
+            const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
+            mouseUpPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mup error', e); });
+          } else if (payload.action === 'scroll') {
+            const dx = Math.trunc(payload.deltaX || 0);
+            const dy = Math.trunc(payload.deltaY || 0);
+            mouseScrollPayload(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] scroll error', e); });
+          }
+          return;
+        }
+        if (payload.type === 'key') {
+          const rawKey = (payload && payload.rawKey) ? String(payload.rawKey) : String(payload && payload.key || '');
+          const lowKey = String((payload && payload.key) || rawKey || '').toLowerCase();
+          let mapped = lowKey;
+          const MODIFIERS = new Set(['shift','control','ctrl','alt','meta','command','capslock']);
+          try {
+            if (['left','right','up','down'].includes(mapped)) {
+              mapped = 'arrow' + mapped;
+            }
+          } catch(e){}
+          if (MODIFIERS.has(mapped)) {
+            const mappedKeyEnum = NUT_KEY_MAP[mapped];
+            try {
+              if (payload.action === 'down') {
+                if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
+                  nutKeyboard.pressKey(mappedKeyEnum).catch(e => { console.error('[agent] pressKey failed', e); });
+                } else if (mappedKeyEnum && nutKeyboard && nutKeyboard.tapKey) {
+                  nutKeyboard.tapKey(mappedKeyEnum).catch(e => { console.error('[agent] tapKey (fallback) failed', e); });
+                } else if (mapped === 'escape' && nutKey && (nutKey.Escape || nutKey.Esc) && nutKeyboard && nutKeyboard.tapKey) {
+                  const escEnum = nutKey.Escape || nutKey.Esc;
+                  nutKeyboard.tapKey(escEnum).catch(e => { console.warn('[agent] tapKey fallback failed', e); });
+                } else {
+                  const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
+                  if (toType && nutKeyboard && nutKeyboard.type) {
+                    nutKeyboard.type(toType).catch(e => { console.error('[agent] type fallback failed', e); });
+                  } else {
+                    console.warn('[agent] no key mapping or method found for', mapped, rawKey);
+                  }
+                }
+                return;
+              } else if (payload.action === 'up') {
+                if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
+                  nutKeyboard.releaseKey(mappedKeyEnum).catch(e => { console.error('[agent] releaseKey failed', e); });
+                } else {
+                  console.debug('[agent] releaseKey not available for', mapped);
+                }
+                return;
+              }
+            } catch (err) {
+              console.error('[agent] key handler error', err);
+            }
+            return;
+          }
+          const mappedKeyEnum = NUT_KEY_MAP[mapped];
+          if (payload.action === 'down') {
+            if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
+              nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
+            } else {
+              const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
+              if (toType && nutKeyboard && nutKeyboard.type) {
+                nutKeyboard.type(toType).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] type failed', e); });
+              }
+            }
+            return;
+          } else if (payload.action === 'up') {
+            if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
+              nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] release failed', e); });
+            }
+            return;
+          }
+        }
+      } catch (err) {
+        if (AGENT_DEBUG) console.error('[agent] control-from-viewer handler error', err);
+      }
+    })();
+  }
+}
+
+let lastPhysicalMoveAt = Date.now();
+let lastProgrammaticMove = 0;
+let lastObservedPos = null;
+let screensaverActive = false;
+let ssTimer = null;
+let ssState = { x: 0, y: 0, vx: 3, vy: 2 };
+let lastViewerControlAt = 0;
+
 async function refreshScreenSizeOnce() {
   try {
     if (nutScreen && typeof nutScreen.width === 'function' && typeof nutScreen.height === 'function') {
@@ -88,17 +292,17 @@ async function refreshScreenSizeOnce() {
   } catch (e) { if (AGENT_DEBUG) console.warn('[agent] refreshScreenSize failed', e); }
 }
 
+let _cachedScreen = { w: 1024, h: 768 };
 setInterval(()=>{ refreshScreenSizeOnce().catch(()=>{}); }, 15_000);
 
 let _lastAgentEmitAt = 0;
-
 function emitAgentMouseNormalized(x, y) {
   try {
     const now = Date.now();
-    if (socket && socket.connected && (now - _lastAgentEmitAt) >= AGENT_MOUSE_EMIT_MIN_MS) {
+    if (ws && ws.readyState === WebSocket.OPEN && (now - _lastAgentEmitAt) >= AGENT_MOUSE_EMIT_MIN_MS) {
       const nx = Math.max(0, Math.min(1, x));
       const ny = Math.max(0, Math.min(1, y));
-      socket.emit('agent-mouse', { code: ROOM, xNorm: Number(nx) || 0, yNorm: Number(ny) || 0 });
+      sendJSON({ type: 'agent-mouse', code: ROOM, xNorm: Number(nx) || 0, yNorm: Number(ny) || 0 });
       _lastAgentEmitAt = now;
       if (AGENT_DEBUG) dlog('[agent] emit agent-mouse', nx, ny);
     }
@@ -106,8 +310,6 @@ function emitAgentMouseNormalized(x, y) {
     if (AGENT_DEBUG) console.error('[agent] emit agent-mouse failed', e);
   }
 }
-
-function dlog(...a){ if(AGENT_DEBUG) console.debug('[agent dbg]', ...a); }
 
 async function moveMouseForPayload(xNorm, yNorm) {
   try {
@@ -117,7 +319,6 @@ async function moveMouseForPayload(xNorm, yNorm) {
     const x = Math.round(Math.max(0, Math.min(1, xNorm)) * (w - 1));
     const y = Math.round(Math.max(0, Math.min(1, yNorm)) * (h - 1));
     if (typeof nutMouse.setPosition === 'function') {
-      // fire-and-forget to avoid awaiting nut-js internal delays
       try { nutMouse.setPosition({ x, y }).catch && nutMouse.setPosition({ x, y }).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] setPosition err', e); }); } catch(e){ try{ nutMouse.setPosition({ x, y }); }catch(e2){} }
     } else if (typeof nutMouse.move === 'function') {
       try { nutMouse.move({ x, y }).catch && nutMouse.move({ x, y }).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move err', e); }); } catch(e){ try{ nutMouse.move({ x, y }); }catch(e2){} }
@@ -201,17 +402,9 @@ async function mouseScrollPayload(dx, dy) {
 }
 
 const AGENT_SCREENSAVER_DISABLE = process.env.AGENT_SCREENSAVER_DISABLE === '1';
-const INACTIVITY_MS = AGENT_SCREENSAVER_DISABLE ? Number.MAX_SAFE_INTEGER : Number(120000); // this is where it takes the time to do whatever
+const INACTIVITY_MS = AGENT_SCREENSAVER_DISABLE ? Number.MAX_SAFE_INTEGER : Number(120000);
 const SS_TICK_MS = Number(process.env.AGENT_SCREENSAVER_TICK_MS || 50);
 const AGENT_SCREENSAVER_EXIT_DELTA = Number(process.env.AGENT_SCREENSAVER_EXIT_DELTA || 18);
-
-let lastPhysicalMoveAt = Date.now();
-let lastProgrammaticMove = 0;
-let lastObservedPos = null;
-let screensaverActive = false;
-let ssTimer = null;
-let ssState = { x: 0, y: 0, vx: 3, vy: 2 };
-let lastViewerControlAt = 0;
 
 async function getCurrentPosFallback() {
   const w = (_cachedScreen && _cachedScreen.w) ? _cachedScreen.w : 1024;
@@ -308,204 +501,6 @@ setInterval(async () => {
   }
 }, 1000);
 
-// ---- Agent-register retry logic ----
-let _registerAttempts = 0;
-let _registered = false;
-let _registerTimer = null;
-
-function _computeBackoffMs(attempt) {
-  const raw = Math.min(AGENT_REGISTER_BASE_MS * Math.pow(2, attempt), AGENT_REGISTER_MAX_MS);
-  // jitter ±AGENT_REGISTER_JITTER
-  const jitter = (Math.random() * 2 - 1) * AGENT_REGISTER_JITTER;
-  const withJitter = Math.max(0, Math.floor(raw * (1 + jitter)));
-  return withJitter;
-}
-
-function _scheduleRegisterRetry(reason) {
-  if (AGENT_REGISTER_MAX_RETRIES > 0 && _registerAttempts >= AGENT_REGISTER_MAX_RETRIES) {
-    if (AGENT_DEBUG) console.warn('[agent] reached max register retries, giving up:', _registerAttempts);
-    return;
-  }
-  const delay = _computeBackoffMs(_registerAttempts);
-  if (AGENT_DEBUG) console.info('[agent] schedule register retry', { attempt: _registerAttempts, delay, reason });
-  if (_registerTimer) clearTimeout(_registerTimer);
-  _registerTimer = setTimeout(() => {
-    if (socket && socket.connected) {
-      _doRegister();
-    } else {
-      // wait until connected event
-      if (AGENT_DEBUG) dlog('[agent] socket not connected yet — will register on connect');
-    }
-  }, delay);
-}
-
-function _doRegister() {
-  if (_registered) return;
-  _registerAttempts++;
-  if (AGENT_DEBUG) console.info('[agent] attempting agent-register', { attempt: _registerAttempts, room: ROOM });
-  try {
-    socket.emit('agent-register', { code: ROOM, secret: AGENT_SECRET }, (res) => {
-      if (res && res.success) {
-        _registered = true;
-        _registerAttempts = 0;
-        if (_registerTimer) { clearTimeout(_registerTimer); _registerTimer = null; }
-        if (AGENT_DEBUG) console.log('[agent] registered for room', ROOM);
-        return;
-      }
-      // registration failed — schedule retry
-      if (AGENT_DEBUG) console.warn('[agent] agent-register failed', res);
-      _scheduleRegisterRetry(res && res.error ? res.error : 'no-response');
-    });
-  } catch (e) {
-    if (AGENT_DEBUG) console.error('[agent] emit agent-register failed', e);
-    _scheduleRegisterRetry(e && e.message ? e.message : 'emit-failed');
-  }
-}
-
-// Ensure we attempt registration when connected and retry on failures/disconnects
-socket.on('connect', () => {
-  if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
-  refreshScreenSizeOnce().catch(()=>{});
-  if (!_registered) {
-    // reset attempts only if starting fresh after a disconnect
-    // (do not reset if we're already in retry loop and haven't succeeded)
-    if (_registerTimer) { clearTimeout(_registerTimer); _registerTimer = null; }
-    // attempt immediately
-    _doRegister();
-  } else {
-    if (AGENT_DEBUG) dlog('[agent] already registered — reconnected');
-  }
-});
-
-socket.on('disconnect', (reason) => {
-  if (AGENT_DEBUG) console.log('[agent] disconnected from server', reason);
-  // mark not-registered so we will re-register on reconnect
-  _registered = false;
-  // schedule immediate retry only when socket reconnects (handled in 'connect')
-});
-
-// If we receive an explicit 'agent-register failed room not found' while connected,
-// ensure we retry (this covers any edge cases where server responds async).
-// Note: server's callback is handled above, but keep this listener defensive.
-socket.on('agent-register-failed', (info) => {
-  if (AGENT_DEBUG) console.warn('[agent] server-side agent-register-failed event', info);
-  _registered = false;
-  _scheduleRegisterRetry(info && info.error ? info.error : 'agent-register-failed-event');
-});
-
-// ---- control-from-viewer handler (unchanged) ----
-socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
-  if (AGENT_DEBUG) console.log('[agent] control-from-viewer received', { fromViewer, payload });
-  if (!nut) { console.warn('[agent] nut-js not loaded; input operations will fail'); }
-
-  try {
-    lastViewerControlAt = Date.now();
-    if (screensaverActive) stopScreensaver('viewer control');
-    if (!payload) return;
-    if (payload.type === 'mouse') {
-      if (payload.action === 'relative') {
-        const dx = Number(typeof payload.dx !== 'undefined' ? payload.dx : payload.deltaX || 0) || 0;
-        const dy = Number(typeof payload.dy !== 'undefined' ? payload.dy : payload.deltaY || 0) || 0;
-        moveMouseRelative(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] rel move error', e); });
-        return;
-      }
-      if (payload.action === 'move' && typeof payload.xNorm === 'number' && typeof payload.yNorm === 'number') {
-        moveMouseForPayload(payload.xNorm, payload.yNorm).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move error', e); });
-      } else if (payload.action === 'click') {
-        const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseClickPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] click error', e); });
-      } else if (payload.action === 'down') {
-        const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseDownPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mdown error', e); });
-      } else if (payload.action === 'up') {
-        const btn = (payload.button === 'right' || payload.button === 'middle') ? payload.button : 'left';
-        mouseUpPayload(btn).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] mup error', e); });
-      } else if (payload.action === 'scroll') {
-        const dx = Math.trunc(payload.deltaX || 0);
-        const dy = Math.trunc(payload.deltaY || 0);
-        mouseScrollPayload(dx, dy).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] scroll error', e); });
-      }
-      return;
-    }
-    if (payload.type === 'key') {
-      const rawKey = (payload && payload.rawKey) ? String(payload.rawKey) : String(payload && payload.key || '');
-      const lowKey = String((payload && payload.key) || rawKey || '').toLowerCase();
-      let mapped = lowKey;
-      const MODIFIERS = new Set(['shift','control','ctrl','alt','meta','command','capslock']);
-      try {
-        if (['left','right','up','down'].includes(mapped)) {
-          mapped = 'arrow' + mapped;
-        }
-      } catch(e){}
-      if (MODIFIERS.has(mapped)) {
-        const mappedKeyEnum = NUT_KEY_MAP[mapped];
-// replace the current 'down'/'up' handling block with this improved one
-try {
-  if (payload.action === 'down') {
-    if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-      // preferred: press (hold)
-      nutKeyboard.pressKey(mappedKeyEnum).catch(e => { console.error('[agent] pressKey failed', e); });
-    } else if (mappedKeyEnum && nutKeyboard && nutKeyboard.tapKey) {
-      // tapKey exists but pressKey doesn't — use tap as fallback
-      nutKeyboard.tapKey(mappedKeyEnum).catch(e => { console.error('[agent] tapKey (fallback) failed', e); });
-    } else if (mapped === 'escape' && nutKey && (nutKey.Escape || nutKey.Esc) && nutKeyboard && nutKeyboard.tapKey) {
-      // explicit escape fallback (kept from existing)
-      const escEnum = nutKey.Escape || nutKey.Esc;
-      nutKeyboard.tapKey(escEnum).catch(e => { console.warn('[agent] tapKey fallback failed', e); });
-    } else {
-      // final fallback to typing a character when appropriate
-      const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
-      if (toType && nutKeyboard && nutKeyboard.type) {
-        nutKeyboard.type(toType).catch(e => { console.error('[agent] type fallback failed', e); });
-      } else {
-        console.warn('[agent] no key mapping or method found for', mapped, rawKey);
-      }
-    }
-    return;
-  } else if (payload.action === 'up') {
-    if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-      nutKeyboard.releaseKey(mappedKeyEnum).catch(e => { console.error('[agent] releaseKey failed', e); });
-    } else {
-      // if no releaseKey, give a clear debug log so we can see this situation
-      console.debug('[agent] releaseKey not available for', mapped);
-    }
-    return;
-  }
-} catch (err) {
-  console.error('[agent] key handler error', err);
-}
-        return;
-      }
-      const mappedKeyEnum = NUT_KEY_MAP[mapped];
-      if (payload.action === 'down') {
-        if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-          nutKeyboard.pressKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] pressKey failed', e); });
-        } else {
-          const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
-          if (toType && nutKeyboard && nutKeyboard.type) {
-            nutKeyboard.type(toType).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] type failed', e); });
-          }
-        }
-        return;
-      } else if (payload.action === 'up') {
-        if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
-          nutKeyboard.releaseKey(mappedKeyEnum).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] release failed', e); });
-        }
-        return;
-      }
-    }
-  } catch (err) {
-    if (AGENT_DEBUG) console.error('[agent] control-from-viewer handler error', err);
-  }
-});
-
-// defensive: if server asks us to register again, reset and try
-socket.on('request-agent-register', () => {
-  if (AGENT_DEBUG) console.info('[agent] server requested agent-register; re-attempting');
-  _registered = false;
-  _doRegister();
-});
-
 try {
   if (process.stdin && process.stdin.setRawMode && process.stdin.isTTY) {
     process.stdin.setRawMode(true);
@@ -518,4 +513,4 @@ try {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
 
-
+connect();

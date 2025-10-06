@@ -1,35 +1,6 @@
-import readline from "node:readline";
-import { stdin as input, stdout as output } from "node:process";
-
-async function promptEnvVar(name, defaultValue = "") {
-  const rl = readline.createInterface({ input, output });
-  const msg = defaultValue ? `${name} [${defaultValue}]: ` : `${name}: `;
-  const answer = await new Promise((resolve) => rl.question(msg, resolve));
-  rl.close();
-  return answer.trim() || defaultValue;
-}
-
-async function initEnv() {
-  let server = process.env.SERVER_URL || "";
-  let room = process.env.ROOM_CODE || "";
-  let secret = process.env.AGENT_SECRET || null;
-
-  if (!server) server = await promptEnvVar("SERVER_URL", "https://streamamethyst.org");
-  if (!room) room = await promptEnvVar("ROOM_CODE");
-  if (!room) {
-    console.error("No room code provided — exiting.");
-    process.exit(1);
-  }
-
-  process.env.SERVER_URL = server;
-  process.env.ROOM_CODE = room;
-  process.env.AGENT_SECRET = secret;
-
-  console.log(`[agent] configured with SERVER_URL=${server} ROOM_CODE=${room}`);
-}
-
-await initEnv();
-
+// agent.js
+// made by chatgpt
+// idc
 
 const SERVER = process.env.SERVER_URL || 'https://streamamethyst.org';
 const ROOM = process.env.ROOM_CODE || '';
@@ -38,16 +9,11 @@ const AGENT_DEBUG = true;
 const AGENT_SENSITIVITY = Number(process.env.AGENT_SENSITIVITY || 1.0);
 const AGENT_MOUSE_EMIT_MIN_MS = Number(process.env.AGENT_MOUSE_EMIT_MIN_MS || 16);
 
-const AGENT_REGISTER_BASE_MS = Number(process.env.AGENT_REGISTER_BASE_MS || 1000); 
-const AGENT_REGISTER_MAX_MS = Number(process.env.AGENT_REGISTER_MAX_MS || 60000); 
-const AGENT_REGISTER_JITTER = Number(process.env.AGENT_REGISTER_JITTER || 0.2); 
-const AGENT_REGISTER_MAX_RETRIES = Number(process.env.AGENT_REGISTER_MAX_RETRIES || 0); 
-
-process.on('exit', (c)=>{ console.log('[agent] process exit', c); });
-process.on('uncaughtException', (e)=>{ console.error('[agent] uncaught', e && e.stack || e); process.exit(98); });
-process.on('unhandledRejection', (e)=>{ console.error('[agent] unhandledRejection', e && e.stack || e); });
-console.log('[agent] starting agent.js bootstrap');
-
+// Agent-register retry/backoff config
+const AGENT_REGISTER_BASE_MS = Number(process.env.AGENT_REGISTER_BASE_MS || 1000); // initial backoff
+const AGENT_REGISTER_MAX_MS = Number(process.env.AGENT_REGISTER_MAX_MS || 60000); // max backoff
+const AGENT_REGISTER_JITTER = Number(process.env.AGENT_REGISTER_JITTER || 0.2); // fraction ± jitter
+const AGENT_REGISTER_MAX_RETRIES = Number(process.env.AGENT_REGISTER_MAX_RETRIES || 0); // 0 = infinite
 
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
@@ -151,7 +117,7 @@ async function moveMouseForPayload(xNorm, yNorm) {
     const x = Math.round(Math.max(0, Math.min(1, xNorm)) * (w - 1));
     const y = Math.round(Math.max(0, Math.min(1, yNorm)) * (h - 1));
     if (typeof nutMouse.setPosition === 'function') {
-
+      // fire-and-forget to avoid awaiting nut-js internal delays
       try { nutMouse.setPosition({ x, y }).catch && nutMouse.setPosition({ x, y }).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] setPosition err', e); }); } catch(e){ try{ nutMouse.setPosition({ x, y }); }catch(e2){} }
     } else if (typeof nutMouse.move === 'function') {
       try { nutMouse.move({ x, y }).catch && nutMouse.move({ x, y }).catch(e=>{ if (AGENT_DEBUG) console.error('[agent] move err', e); }); } catch(e){ try{ nutMouse.move({ x, y }); }catch(e2){} }
@@ -235,7 +201,7 @@ async function mouseScrollPayload(dx, dy) {
 }
 
 const AGENT_SCREENSAVER_DISABLE = process.env.AGENT_SCREENSAVER_DISABLE === '1';
-const INACTIVITY_MS = AGENT_SCREENSAVER_DISABLE ? Number.MAX_SAFE_INTEGER : Number(120000); 
+const INACTIVITY_MS = AGENT_SCREENSAVER_DISABLE ? Number.MAX_SAFE_INTEGER : Number(120000); // this is where it takes the time to do whatever
 const SS_TICK_MS = Number(process.env.AGENT_SCREENSAVER_TICK_MS || 50);
 const AGENT_SCREENSAVER_EXIT_DELTA = Number(process.env.AGENT_SCREENSAVER_EXIT_DELTA || 18);
 
@@ -342,13 +308,14 @@ setInterval(async () => {
   }
 }, 1000);
 
+// ---- Agent-register retry logic ----
 let _registerAttempts = 0;
 let _registered = false;
 let _registerTimer = null;
 
 function _computeBackoffMs(attempt) {
   const raw = Math.min(AGENT_REGISTER_BASE_MS * Math.pow(2, attempt), AGENT_REGISTER_MAX_MS);
-
+  // jitter ±AGENT_REGISTER_JITTER
   const jitter = (Math.random() * 2 - 1) * AGENT_REGISTER_JITTER;
   const withJitter = Math.max(0, Math.floor(raw * (1 + jitter)));
   return withJitter;
@@ -366,7 +333,7 @@ function _scheduleRegisterRetry(reason) {
     if (socket && socket.connected) {
       _doRegister();
     } else {
-
+      // wait until connected event
       if (AGENT_DEBUG) dlog('[agent] socket not connected yet — will register on connect');
     }
   }, delay);
@@ -385,7 +352,7 @@ function _doRegister() {
         if (AGENT_DEBUG) console.log('[agent] registered for room', ROOM);
         return;
       }
-
+      // registration failed — schedule retry
       if (AGENT_DEBUG) console.warn('[agent] agent-register failed', res);
       _scheduleRegisterRetry(res && res.error ? res.error : 'no-response');
     });
@@ -395,15 +362,15 @@ function _doRegister() {
   }
 }
 
-setInterval(()=>{ try{ socket.emit('agent-heartbeat', { t: Date.now() }); }catch(_){} }, 10000);
-
+// Ensure we attempt registration when connected and retry on failures/disconnects
 socket.on('connect', () => {
   if (AGENT_DEBUG) console.log('[agent] connected to server', SERVER, 'socket id', socket.id);
   refreshScreenSizeOnce().catch(()=>{});
   if (!_registered) {
-
+    // reset attempts only if starting fresh after a disconnect
+    // (do not reset if we're already in retry loop and haven't succeeded)
     if (_registerTimer) { clearTimeout(_registerTimer); _registerTimer = null; }
-
+    // attempt immediately
     _doRegister();
   } else {
     if (AGENT_DEBUG) dlog('[agent] already registered — reconnected');
@@ -412,17 +379,21 @@ socket.on('connect', () => {
 
 socket.on('disconnect', (reason) => {
   if (AGENT_DEBUG) console.log('[agent] disconnected from server', reason);
-
+  // mark not-registered so we will re-register on reconnect
   _registered = false;
-
+  // schedule immediate retry only when socket reconnects (handled in 'connect')
 });
 
+// If we receive an explicit 'agent-register failed room not found' while connected,
+// ensure we retry (this covers any edge cases where server responds async).
+// Note: server's callback is handled above, but keep this listener defensive.
 socket.on('agent-register-failed', (info) => {
   if (AGENT_DEBUG) console.warn('[agent] server-side agent-register-failed event', info);
   _registered = false;
   _scheduleRegisterRetry(info && info.error ? info.error : 'agent-register-failed-event');
 });
 
+// ---- control-from-viewer handler (unchanged) ----
 socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
   if (AGENT_DEBUG) console.log('[agent] control-from-viewer received', { fromViewer, payload });
   if (!nut) { console.warn('[agent] nut-js not loaded; input operations will fail'); }
@@ -468,21 +439,21 @@ socket.on('control-from-viewer', async ({ fromViewer, payload } = {}) => {
       } catch(e){}
       if (MODIFIERS.has(mapped)) {
         const mappedKeyEnum = NUT_KEY_MAP[mapped];
-
+// replace the current 'down'/'up' handling block with this improved one
 try {
   if (payload.action === 'down') {
     if (mappedKeyEnum && nutKeyboard && nutKeyboard.pressKey) {
-
+      // preferred: press (hold)
       nutKeyboard.pressKey(mappedKeyEnum).catch(e => { console.error('[agent] pressKey failed', e); });
     } else if (mappedKeyEnum && nutKeyboard && nutKeyboard.tapKey) {
-
+      // tapKey exists but pressKey doesn't — use tap as fallback
       nutKeyboard.tapKey(mappedKeyEnum).catch(e => { console.error('[agent] tapKey (fallback) failed', e); });
     } else if (mapped === 'escape' && nutKey && (nutKey.Escape || nutKey.Esc) && nutKeyboard && nutKeyboard.tapKey) {
-
+      // explicit escape fallback (kept from existing)
       const escEnum = nutKey.Escape || nutKey.Esc;
       nutKeyboard.tapKey(escEnum).catch(e => { console.warn('[agent] tapKey fallback failed', e); });
     } else {
-
+      // final fallback to typing a character when appropriate
       const toType = (rawKey && rawKey.length === 1) ? rawKey : null;
       if (toType && nutKeyboard && nutKeyboard.type) {
         nutKeyboard.type(toType).catch(e => { console.error('[agent] type fallback failed', e); });
@@ -495,7 +466,7 @@ try {
     if (mappedKeyEnum && nutKeyboard && nutKeyboard.releaseKey) {
       nutKeyboard.releaseKey(mappedKeyEnum).catch(e => { console.error('[agent] releaseKey failed', e); });
     } else {
-
+      // if no releaseKey, give a clear debug log so we can see this situation
       console.debug('[agent] releaseKey not available for', mapped);
     }
     return;
@@ -528,6 +499,7 @@ try {
   }
 });
 
+// defensive: if server asks us to register again, reset and try
 socket.on('request-agent-register', () => {
   if (AGENT_DEBUG) console.info('[agent] server requested agent-register; re-attempting');
   _registered = false;
@@ -545,15 +517,5 @@ try {
 } catch (e) {
   if (AGENT_DEBUG) console.warn('[agent] panic key setup failed', e);
 }
-
-try {
-  socket.on('request-keyframe', (data)=>{
-    try { console.log('[agent] request-keyframe received', data); } catch(_){}
-    try { if (typeof forceKeyframe === 'function') forceKeyframe(); } catch(_){}
-    try { socket.emit('agent-log', { level:'info', msg:'request-keyframe received' }); } catch(_){}
-  });
-} catch(_){}
-
-
 
 

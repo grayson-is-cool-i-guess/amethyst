@@ -4,8 +4,8 @@ amethyst allows streaming from any iframe, so you can simply open a local file w
 
 
 # amethyst is in OPEN BETA
-no source code will be posted for now (because its so skidded) and because you don't want to see it
-
+The HTML source code can be found by opening the site in DevTools or ripping it with https://saveweb2zip.com
+The backend source will never be public because it's used for my unblocked games thing for verifying private info
 
 # please, PLEASE, never expect this to be used commonly.
 amethyst is in very early beta. its performance will not be great. i've already heavily optimized it to run at how it is. this is literally running with a node server and a prayer.

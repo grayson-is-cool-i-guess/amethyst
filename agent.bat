@@ -1,52 +1,77 @@
-:: agent that automates everything
-:: also made with AI
-:: im super cool for using ai right guys
-
-
 @echo off
 setlocal enabledelayedexpansion
 
-set "INSTALL_DIR=%ProgramFiles%\AmethystAgent"
-if "%PROCESSOR_ARCHITECTURE%"=="x86" set "INSTALL_DIR=%ProgramFiles(x86)%\AmethystAgent"
-if not exist "%ProgramFiles%" set "INSTALL_DIR=%TEMP%\AmethystAgent"
+REM === Install dir (user profile so we avoid Program Files permission weirdness) ===
+set "INSTALL_DIR=%USERPROFILE%\AmethystAgent"
 
+REM === Where to fetch the agent and which packages to install ===
 set "AGENT_URL=https://github.com/grayson-is-cool-i-guess/amethyst/raw/refs/heads/main/agent.js"
 set "AGENT_NPM_PACKAGES=@nut-tree-fork/nut-js socket.io-client socket.io express"
 
+REM === Elevate to admin if not already (needed for Node MSI on first run) ===
 >nul 2>&1 net session
 if %errorlevel% neq 0 (
-    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
+REM === Ensure Node.js is installed ===
 node -v >nul 2>&1
 if %errorlevel% neq 0 (
-    powershell -Command "Invoke-WebRequest -Uri 'https://nodejs.org/dist/v20.9.0/node-v20.9.0-x64.msi' -OutFile '%TEMP%\nodejs.msi'"
+    echo Installing Node.js 20.9.0...
+    powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://nodejs.org/dist/v20.9.0/node-v20.9.0-x64.msi' -OutFile '%TEMP%\nodejs.msi'"
     msiexec /i "%TEMP%\nodejs.msi" /quiet /norestart
+    echo Node installed. Close this window and run this script again.
     pause
     exit /b
 )
 
+REM === Create install directory ===
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 
-powershell -Command "Invoke-WebRequest -Uri '%AGENT_URL%' -OutFile '%INSTALL_DIR%\agent.js' -UseBasicParsing"
+REM === Fetch latest agent.js ===
+echo Downloading agent.js to "%INSTALL_DIR%"...
+powershell -NoProfile -Command "Invoke-WebRequest -Uri '%AGENT_URL%' -OutFile '%INSTALL_DIR%\agent.js' -UseBasicParsing"
 
 cd /d "%INSTALL_DIR%"
-if not exist package.json npm init -y >nul 2>&1
 
-:: Install all required npm packages
-start cmd /k "cd /d %INSTALL_DIR% && npm install %AGENT_NPM_PACKAGES%"
+REM === Init package.json if missing ===
+if not exist package.json (
+    call npm init -y >nul 2>&1
+)
 
-pause
+REM === Install required packages (synchronously) ===
+echo Installing npm packages...
+call npm install %AGENT_NPM_PACKAGES%
+if errorlevel 1 (
+    echo.
+    echo npm install failed. Check the error above and fix it, then re-run this script.
+    pause
+    exit /b
+)
 
-set /p ROOM_CODE="Room ID: "
-if "%ROOM_CODE%"=="" exit /b
+echo.
+set /p ROOM_CODE=Room ID: 
+if "%ROOM_CODE%"=="" (
+    echo No Room ID provided. Exiting.
+    exit /b
+)
 
-start cmd /k "set ROOM_CODE=%ROOM_CODE%&& set SERVER_URL=https://streamamethyst.org node agent.js"
+REM === Set env vars and run agent in the SAME window ===
+set "ROOM_CODE=%ROOM_CODE%"
+set "SERVER_URL=https://streamamethyst.org"
 
+echo.
+echo Launching agent with:
+echo   INSTALL_DIR=%INSTALL_DIR%
+echo   ROOM_CODE=%ROOM_CODE%
+echo   SERVER_URL=%SERVER_URL%
+echo.
+
+REM If agent crashes, you will see the error here.
+node agent.js
+
+echo.
+echo Agent exited with code %errorlevel%.
 pause
 exit /b
-
-
-
-

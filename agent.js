@@ -10,6 +10,12 @@ const AGENT_REGISTER_MAX_MS = Number(process.env.AGENT_REGISTER_MAX_MS || 60000)
 const AGENT_REGISTER_JITTER = Number(process.env.AGENT_REGISTER_JITTER || 0.2); 
 const AGENT_REGISTER_MAX_RETRIES = Number(process.env.AGENT_REGISTER_MAX_RETRIES || 0); 
 
+process.on('exit', (c)=>{ console.log('[agent] process exit', c); });
+process.on('uncaughtException', (e)=>{ console.error('[agent] uncaught', e && e.stack || e); process.exit(98); });
+process.on('unhandledRejection', (e)=>{ console.error('[agent] unhandledRejection', e && e.stack || e); });
+console.log('[agent] starting agent.js bootstrap');
+
+
 if (!ROOM) {
   console.error('Please set ROOM_CODE env var to the room code to register as agent');
   process.exit(1);
@@ -514,3 +520,4 @@ try {
     try { socket.emit('agent-log', { level:'info', msg:'request-keyframe received' }); } catch(_){}
   });
 } catch(_){}
+

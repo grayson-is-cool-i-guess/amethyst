@@ -42,13 +42,11 @@ pause
 set /p ROOM_CODE="Room ID: "
 if "%ROOM_CODE%"=="" exit /b
 
-set /p SERVER_URL="Server URL (default https://streamamethyst.org): "
-if "%SERVER_URL%"=="" set "SERVER_URL=https://streamamethyst.org"
-
-start cmd /k "set ROOM_CODE=%ROOM_CODE%&& set SERVER_URL=%SERVER_URL%&& node agent.js"
+start cmd /k "set ROOM_CODE=%ROOM_CODE%&& set SERVER_URL=https://streamamethyst.org node agent.js"
 
 pause
 exit /b
+
 
 
 
